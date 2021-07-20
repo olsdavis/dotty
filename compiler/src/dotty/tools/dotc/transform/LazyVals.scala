@@ -50,6 +50,10 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     else nullables.toList
   }
 
+  private def initBlock(stats: List[Tree])(using Context): Block = stats match
+    case Nil => throw new IllegalArgumentException("trying to create an empty Block")
+    case x :: Nil => Block(List(x), EmptyTree)
+    case x :: xs => Block(stats.init, stats.last)
 
   override def prepareForUnit(tree: Tree)(using Context): Context = {
     if (lazyValNullables == null)
@@ -156,7 +160,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     val holderName = LazyLocalName.fresh(xname)
     val holderImpl = defn.LazyHolder()(tpe.typeSymbol)
     val holderSymbol = newSymbol(x.symbol.owner, holderName, containerFlags, holderImpl.typeRef, coord = x.span)
-    val holderTree = ValDef(holderSymbol, New(holderImpl.typeRef, Nil))
+    val holderTree = ValDef(holderSymbol, Select(New(holderImpl.typeRef, Nil), StdNames.nme.CONSTRUCTOR))
 
     val holderRef = ref(holderSymbol)
     val getValue = holderRef.select(lazyNme.value).ensureApplied.withSpan(x.span)
@@ -272,6 +276,141 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     }
   }
 
+  /**
+   * Create a threadsafe lazy accessor equivalent to the following code:
+   * ```
+   * private @volatile var _x: AnyRef = null
+   * @tailrec def x: A =
+   *    _x match
+   *    case current: A =>
+   *        current
+   *    case null =>
+   *        if CAS(_x, null, Evaluating) then
+   *            var result: AnyRef = null // here, we need `AnyRef` to possibly assign `NULL`
+   *            try
+   *                result = rhs
+   *                if result == null then result = NULL // drop if A is non-nullable
+   *            finally
+   *                if !CAS(_x, Evaluating, result) then
+   *                    val lock = _x.asInstanceOf[Waiting]
+   *                    CAS(_x, lock, result)
+   *                    lock.release()
+   *        x
+   *    case Evaluating =>
+   *        CAS(_x, Evaluating, new Waiting)
+   *        x
+   *    case current: Waiting =>
+   *        current.awaitRelease()
+   *        x
+   *    case NULL => null
+   * ```
+   * Where `Evaluating` and `NULL` are represented by `object`s and `Waiting` by a class that
+   * allows awaiting the completion of the evaluation. Note that since tail-recursive
+   * functions are transformed *before* lazy-vals, this implementation directly implements
+   * the resulting loop.
+   * 
+   * @param methodSymbol  the symbol of the new method
+   * @param claz          the class containing this lazy val field
+   * @param target        the target synthetic field
+   * @param rhs           the right-hand side expression of the lazy val
+   * @param tp            the type of the lazy val
+   * @param offset        the offset of the field in the bitmap
+   * @param getFlag       a flag for the volatile get function
+   * @param objCasFlag    a flag for the CAS function operating on objects
+   * @param waiting       a reference to the `Waiting` runtime class
+   * @param evaluating    a reference to the `Evaluating` runtime object
+   * @param nullValued    a reference to the `NULL` runtime object
+   */
+  def mkThreadSafeDef(methodSymbol: TermSymbol,
+                      claz: ClassSymbol,
+                      target: Symbol,
+                      rhs: Tree,
+                      tp: Type,
+                      offset: Tree,
+                      objCasFlag: Tree,
+                      waiting: Tree,
+                      evaluating: Tree,
+                      nullValued: Tree)(using Context): DefDef = {
+    /*
+    TODO: fix this issue with the type of `result` in the try-finally block
+    Original type : <notype>
+    After checking: Unit
+    Original tree : if result.==(null) then result = scala.runtime.LazyVals.NULL
+    After checking: if result.==(null) then result = scala.runtime.LazyVals.NULL else ()
+    Why different :
+                Subtype trace:
+      ==> Unit  <:  <notype>
+        ==> Unit  <:  <notype> (recurring)
+        <== Unit  <:  <notype> (recurring) = false
+      <== Unit  <:  <notype> = false
+    */
+    val thiz = This(claz)
+    // in the above code: case current: A => ...
+    val done = {
+      val curr = newSymbol(methodSymbol, lazyNme.current, Synthetic | Case, tp)
+      CaseDef(
+        Bind(curr, ref(curr)), EmptyTree, Return(ref(curr), methodSymbol)
+      )
+    }
+    // in the above code: case null => ...
+    val unevaluated = {
+      // var res: A
+      val resSymb = newSymbol(methodSymbol, lazyNme.result, Synthetic | Mutable, defn.ObjectType)
+      // releasing block in finally
+      val lockRel = {
+        val lockSymb = newSymbol(methodSymbol, lazyNme.lock, Synthetic, waiting.typeOpt)
+        initBlock(ValDef(lockSymb, ref(target).cast(waiting.typeOpt))
+          :: objCasFlag.appliedTo(thiz, offset, ref(lockSymb), ref(resSymb))
+          :: ref(lockSymb).select(lazyNme.RLazyVals.waitingRelease).appliedTo(EmptyTree) :: Nil)
+      }
+      // finally block
+      val fin = If(
+        objCasFlag.appliedTo(thiz, offset, evaluating, ref(resSymb)), 
+        EmptyTree, // NOT condition
+        lockRel // lock release
+      )
+      // entire try block
+      val evaluate = Try(
+        initBlock(Assign(ref(resSymb), rhs) // try result = rhs
+          :: If(ref(resSymb).equal(nullLiteral), Assign(ref(resSymb), nullValued), EmptyTree) // if result == null then result = NULL
+          :: Nil),
+        Nil,
+        fin
+      )
+      // if CAS(...)
+      val firstIf = If(
+        objCasFlag.appliedTo(thiz, offset, nullLiteral, evaluating),
+        initBlock(ValDef(resSymb, defaultValue(tp)) // var result: A = null
+          :: evaluate // try ... finally ...
+          :: Nil),
+        EmptyTree
+      )
+      CaseDef(
+        nullLiteral, EmptyTree, firstIf
+      )
+    }
+    // in the above code: case Evaluating => ...
+    val currentlyEvaluating = CaseDef(
+      evaluating, EmptyTree, objCasFlag.appliedTo(thiz, offset, evaluating, Select(New(waiting), StdNames.nme.CONSTRUCTOR))
+    )
+    // in the above code: case Waiting => ...
+    val currentlyWaiting = {
+      val curr = newSymbol(methodSymbol, lazyNme.current, Synthetic | Case, waiting.typeOpt)
+      CaseDef(
+        Bind(curr, ref(curr)), EmptyTree, 
+        ref(curr).select(lazyNme.RLazyVals.waitingAwaitRelease).appliedTo(EmptyTree)
+      )
+    }
+    // in the above code: case NULL => ...
+    val nullEvaluated = CaseDef(
+      nullValued, EmptyTree, Return(nullLiteral, methodSymbol)
+    )
+    val cases = done :: unevaluated :: currentlyEvaluating :: currentlyWaiting :: nullEvaluated :: Nil
+    val body = Match(ref(target), cases)
+    val mainLoop = WhileDo(EmptyTree, body) // while (true) do { body }
+    DefDef(methodSymbol, mainLoop)
+  }
+
   /** Create a threadsafe lazy accessor equivalent to such code
     * ```
     * def methodSymbol(): Int = {
@@ -303,7 +442,8 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     * }
     * ```
     */
-  def mkThreadSafeDef(methodSymbol: TermSymbol,
+  @deprecated("a newer scheme is now used") // TODO: remove dead code
+  def mkThreadSafeDef_old(methodSymbol: TermSymbol,
                       claz: ClassSymbol,
                       ord: Int,
                       target: Symbol,
@@ -374,11 +514,13 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
 
   def transformMemberDefThreadSafe(x: ValOrDefDef)(using Context): Thicket = {
     assert(!(x.symbol is Mutable))
-
+    import dotty.tools.dotc.core.Types._
+    
+    val runtimeModule = "scala.runtime.LazyVals"
     val tpe = x.tpe.widen.resultType.widen
     val claz = x.symbol.owner.asClass
     val thizClass = Literal(Constant(claz.info))
-    val helperModule = requiredModule("scala.runtime.LazyVals")
+    val helperModule = requiredModule(runtimeModule)
     val getOffset = Select(ref(helperModule), lazyNme.RLazyVals.getOffset)
     var offsetSymbol: TermSymbol = null
     var flag: Tree = EmptyTree
@@ -419,18 +561,20 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     }
 
     val containerName = LazyLocalName.fresh(x.name.asTermName)
-    val containerSymbol = newSymbol(claz, containerName, x.symbol.flags &~ containerFlagsMask | containerFlags, tpe, coord = x.symbol.coord).enteredAfter(this)
+    val containerSymbol = newSymbol(claz, containerName, x.symbol.flags &~ containerFlagsMask | containerFlags, defn.ObjectType, coord = x.symbol.coord).enteredAfter(this)
+    containerSymbol.addAnnotation(defn.VolatileAnnot) // private @volatile var _x: AnyRef
 
-    val containerTree = ValDef(containerSymbol, defaultValue(tpe))
+    val containerTree = ValDef(containerSymbol, defaultValue(claz.typeRef))
 
+    val waiting = requiredClass(s"$runtimeModule.${lazyNme.RLazyVals.waiting}")
+    val evaluating = Select(ref(helperModule), lazyNme.RLazyVals.evaluating)
+    val nullValued = Select(ref(helperModule), lazyNme.RLazyVals.nullValued)
+    val objCas = Select(ref(helperModule), lazyNme.RLazyVals.objCas)
     val offset =  ref(offsetSymbol)
-    val getFlag = Select(ref(helperModule), lazyNme.RLazyVals.get)
-    val setFlag = Select(ref(helperModule), lazyNme.RLazyVals.setFlag)
-    val wait =    Select(ref(helperModule), lazyNme.RLazyVals.wait4Notification)
-    val state =   Select(ref(helperModule), lazyNme.RLazyVals.state)
-    val cas =     Select(ref(helperModule), lazyNme.RLazyVals.cas)
+    val wait   =    Select(ref(helperModule), lazyNme.RLazyVals.wait4Notification)
 
-    val accessor = mkThreadSafeDef(x.symbol.asTerm, claz, ord, containerSymbol, x.rhs, tpe, offset, getFlag, state, cas, setFlag, wait)
+    val accessor = mkThreadSafeDef(x.symbol.asTerm, claz, containerSymbol, x.rhs, tpe, offset, objCas, ref(waiting), evaluating, nullValued)
+    // TODO: remove the extra flag field (unused in the new scheme)
     if (flag eq EmptyTree)
       Thicket(containerTree, accessor)
     else Thicket(containerTree, flag, accessor)
@@ -444,6 +588,12 @@ object LazyVals {
     import Names.TermName
     object RLazyVals {
       import scala.runtime.LazyVals.{Names => N}
+      val waiting: TermName             = N.waiting.toTermName
+      val waitingAwaitRelease: TermName = N.waitingAwaitRelease.toTermName
+      val waitingRelease: TermName      = N.waitingRelease.toTermName
+      val evaluating: TermName        = N.evaluating.toTermName
+      val nullValued: TermName        = N.nullValued.toTermName
+      val objCas: TermName            = N.objCas.toTermName
       val get: TermName               = N.get.toTermName
       val setFlag: TermName           = N.setFlag.toTermName
       val wait4Notification: TermName = N.wait4Notification.toTermName
@@ -458,5 +608,7 @@ object LazyVals {
     val initialized: TermName = "initialized".toTermName
     val initialize: TermName  = "initialize".toTermName
     val retry: TermName       = "retry".toTermName
+    val current: TermName     = "current".toTermName
+    val lock: TermName        = "lock".toTermName
   }
 }
