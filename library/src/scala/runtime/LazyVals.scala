@@ -68,8 +68,8 @@ object LazyVals {
   object Evaluating
 
   /**
-   * Used to indicate the state of a lazy val that has not been evaluated
-   * yet.
+   * Used to indicate the state of a lazy val that has been evaluated to
+   * `null`.
    */
   object NULL
 
