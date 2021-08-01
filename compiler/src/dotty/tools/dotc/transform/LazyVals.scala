@@ -307,7 +307,37 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
    * Where `Evaluating` and `NULL` are represented by `object`s and `Waiting` by a class that
    * allows awaiting the completion of the evaluation. Note that since tail-recursive
    * functions are transformed *before* lazy-vals, this implementation directly implements
-   * the resulting loop.
+   * the resulting loop. `PatternMatcher` coming before `LazyVals`, the pattern matching block
+   * is implemented using if-s. That is:
+   * 
+   * ```
+   * private @volatile var _x: AnyRef = null
+   * def x: A =
+   *   while true do
+   *     if _x == null then
+   *       if CAS(_x, null, Evaluating) then
+   *         var result: AnyRef = null // here, we need `AnyRef` to possibly assign `NULL`
+   *          try
+   *            result = rhs
+   *            if result == null then result = NULL // drop if A is non-nullable
+   *          finally
+   *            if !CAS(_x, Evaluating, result) then
+   *              val lock = _x.asInstanceOf[Waiting]
+   *              CAS(_x, lock, result)
+   *              lock.release()
+   *     else
+   *       val current: AnyRef = _x
+   *       if current.isInstanceOf[A] then
+   *         current.asInstanceOf[A]
+   *       else if current.isInstanceOf[NULL] then
+   *         null
+   *       else if current.isInstanceOf[Waiting] then
+   *         // It is OK to call `awaitRelease` here, as if it is completed, then there will be no `wait`
+   *         current.asInstanceOf[Waiting].awaitRelease()
+   *       else // `current` is Evaluating
+   *         CAS(current, Evaluating, new Waiting)
+   *   end while
+   * ```
    * 
    * @param methodSymbol  the symbol of the new method
    * @param claz          the class containing this lazy val field
@@ -332,14 +362,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
                       evaluating: Tree,
                       nullValued: Tree)(using Context): DefDef = {
     val thiz = This(claz)
-    // in the above code: case current: A => ...
-    val done = {
-      val curr = newSymbol(methodSymbol, lazyNme.current, Synthetic | Case, tp)
-      CaseDef(
-        Bind(curr, ref(claz)), EmptyTree, Return(ref(curr), methodSymbol)
-      )
-    }
-    // TODO: give names to avoid duplicates
+    // TODO: generate names to avoid duplicates
     val discardSymb = newSymbol(methodSymbol, "discard".toTermName, Method | Synthetic, MethodType(Nil)(_ => Nil, _ => defn.UnitType))
     val discardDef = DefDef(discardSymb, initBlock(
       objCasFlag.appliedTo(thiz, offset, evaluating, Select(New(waiting), StdNames.nme.CONSTRUCTOR).ensureApplied)
@@ -371,39 +394,39 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
         fin
       )
       // if CAS(...)
-      val firstIf = If(
+      If(
         objCasFlag.appliedTo(thiz, offset, nullLiteral, evaluating),
         initBlock(ValDef(resSymb, defaultValue(tp)) // var result: A = null
           :: evaluate // try ... finally ...
           :: Nil),
         EmptyTree
       ).withType(defn.UnitType)
-      CaseDef(
-        nullLiteral, EmptyTree, firstIf
+    }
+    val ifNotNull = {
+      val current = newSymbol(methodSymbol, lazyNme.result, Synthetic, defn.ObjectType)
+      initBlock(
+        ValDef(current, ref(target))
+          :: If(
+            ref(current).select(defn.Any_isInstanceOf).appliedToType(tp),
+            Return(ref(current).select(defn.Any_asInstanceOf).appliedToType(tp), methodSymbol),
+            // not an A
+            If(
+              ref(current).select(defn.Any_isInstanceOf).appliedToTypeTree(nullValued),
+              Return(defaultValue(tp), methodSymbol),
+              // not a NULL
+              If(
+                ref(current).select(defn.Any_isInstanceOf).appliedToTypeTree(waiting),
+                ref(current).select(defn.Any_asInstanceOf).appliedToTypeTree(waiting).select(lazyNme.RLazyVals.waitingAwaitRelease).ensureApplied,
+                // not a Waiting, then is an Evaluating
+                ref(discardSymb).ensureApplied
+              )
+            )
+          )
+          :: Nil
       )
     }
-    // in the above code: case Evaluating => ...
-    val currentlyEvaluating = CaseDef(
-      evaluating, EmptyTree,
-      // objCasFlag.appliedTo(thiz, offset, evaluating, Select(New(waiting), StdNames.nme.CONSTRUCTOR).ensureApplied)
-      ref(discardSymb).ensureApplied
-    )
-    // in the above code: case Waiting => ...
-    val currentlyWaiting = {
-      val curr = newSymbol(methodSymbol, lazyNme.current, Synthetic | Case, waiting.typeOpt)
-      CaseDef(
-        Bind(curr, waiting), EmptyTree, 
-        ref(curr).select(lazyNme.RLazyVals.waitingAwaitRelease).ensureApplied
-      )
-    }
-    // in the above code: case NULL => ...
-    val nullEvaluated = CaseDef(
-      nullValued, EmptyTree, Return(defaultValue(tp), methodSymbol)
-    )
-    val cases = done :: unevaluated :: currentlyEvaluating :: currentlyWaiting :: nullEvaluated :: Nil
-    val body = Match(ref(target), cases)
+    val body = If(ref(target).equal(nullLiteral), unevaluated, ifNotNull)
     val mainLoop = WhileDo(EmptyTree, body) // while (true) do { body }
-    // TODO: can pattern matching be done at this stage of the compilation? doesn't seem to work
     DefDef(methodSymbol, initBlock(discardDef :: mainLoop :: Nil))
   }
 
