@@ -55,6 +55,12 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     case x :: Nil => Block(List(x), EmptyTree)
     case x :: xs => Block(stats.init, stats.last)
 
+  private def needsBoxing(tp: Type)(using Context): Boolean = tp != NoType && tp != defn.UnitType && tp.classSymbol.isPrimitiveValueClass
+    
+  private def boxIfCan(tp: Type)(using Context): Type =
+    assert(needsBoxing(tp))
+    defn.boxedType(tp)
+
   override def prepareForUnit(tree: Tree)(using Context): Context = {
     if (lazyValNullables == null)
       lazyValNullables = ctx.base.collectNullableFieldsPhase.asInstanceOf[CollectNullableFields].lazyValNullables
@@ -314,25 +320,24 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
    * private @volatile var _x: AnyRef = null
    * def x: A =
    *   while true do
-   *     if _x == null then
+   *     val current: AnyRef = _x
+   *     if current == null then
    *       if CAS(_x, null, Evaluating) then
-   *         var result: AnyRef = null // here, we need `AnyRef` to possibly assign `NULL`
-   *          try
-   *            result = rhs
-   *            if result == null then result = NULL // drop if A is non-nullable
-   *          finally
-   *            if !CAS(_x, Evaluating, result) then
-   *              val lock = _x.asInstanceOf[Waiting]
-   *              CAS(_x, lock, result)
-   *              lock.release()
+   *         var result: AnyRef = null // TODO: maybe move the evaluation directly in the try, and fallback in catch
+   *         try
+   *           result = rhs
+   *           if result == null then result = NULL
+   *         finally
+   *           if !CAS(_x, Evaluating, result) then
+   *             val lock = _x.asInstanceOf[Waiting]
+   *             CAS(_x, lock, result)
+   *             lock.release()
    *     else
-   *       val current: AnyRef = _x
    *       if current.isInstanceOf[A] then
    *         current.asInstanceOf[A]
    *       else if current.isInstanceOf[NULL] then
    *         null
    *       else if current.isInstanceOf[Waiting] then
-   *         // It is OK to call `awaitRelease` here, as if it is completed, then there will be no `wait`
    *         current.asInstanceOf[Waiting].awaitRelease()
    *       else // `current` is Evaluating
    *         CAS(current, Evaluating, new Waiting)
@@ -362,15 +367,14 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
                       evaluating: Tree,
                       nullValued: Tree)(using Context): DefDef = {
     val thiz = This(claz)
-    // TODO: generate names to avoid duplicates
+    // TODO: generate names to avoid conflicts
     val discardSymb = newSymbol(methodSymbol, "discard".toTermName, Method | Synthetic, MethodType(Nil)(_ => Nil, _ => defn.UnitType))
     val discardDef = DefDef(discardSymb, initBlock(
       objCasFlag.appliedTo(thiz, offset, evaluating, Select(New(waiting), StdNames.nme.CONSTRUCTOR).ensureApplied)
-        :: Return(unitLiteral, discardSymb) :: Nil
-    ))
-    // in the above code: case null => ...
+        :: Return(unitLiteral, discardSymb) :: Nil))
+    // if observed a null value
     val unevaluated = {
-      // var res: A
+      // var res: AnyRef
       val resSymb = newSymbol(methodSymbol, lazyNme.result, Synthetic | Mutable, defn.ObjectType)
       // releasing block in finally
       val lockRel = {
@@ -387,7 +391,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
       ).withType(defn.UnitType)
       // entire try block
       val evaluate = Try(
-        initBlock(Assign(ref(resSymb), rhs) // try result = rhs
+        initBlock(Assign(ref(resSymb), if needsBoxing(tp) && rhs != EmptyTree then rhs.ensureConforms(boxIfCan(tp)) else rhs) // try result = rhs
           :: If(ref(resSymb).equal(nullLiteral), Assign(ref(resSymb), nullValued), EmptyTree).withType(defn.UnitType) // if result == null then result = NULL
           :: Nil),
         Nil,
@@ -396,139 +400,34 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
       // if CAS(...)
       If(
         objCasFlag.appliedTo(thiz, offset, nullLiteral, evaluating),
-        initBlock(ValDef(resSymb, defaultValue(tp)) // var result: A = null
+        initBlock(ValDef(resSymb, nullLiteral) // var result: AnyRef = null
           :: evaluate // try ... finally ...
           :: Nil),
         EmptyTree
       ).withType(defn.UnitType)
     }
-    val ifNotNull = {
-      val current = newSymbol(methodSymbol, lazyNme.result, Synthetic, defn.ObjectType)
-      initBlock(
-        ValDef(current, ref(target))
-          :: If(
-            ref(current).select(defn.Any_isInstanceOf).appliedToType(tp),
-            Return(ref(current).select(defn.Any_asInstanceOf).appliedToType(tp), methodSymbol),
-            // not an A
-            If(
-              ref(current).select(defn.Any_isInstanceOf).appliedToTypeTree(nullValued),
-              Return(defaultValue(tp), methodSymbol),
-              // not a NULL
-              If(
-                ref(current).select(defn.Any_isInstanceOf).appliedToTypeTree(waiting),
-                ref(current).select(defn.Any_asInstanceOf).appliedToTypeTree(waiting).select(lazyNme.RLazyVals.waitingAwaitRelease).ensureApplied,
-                // not a Waiting, then is an Evaluating
-                ref(discardSymb).ensureApplied
-              )
-            )
-          )
-          :: Nil
-      )
-    }
-    val body = If(ref(target).equal(nullLiteral), unevaluated, ifNotNull)
-    val mainLoop = WhileDo(EmptyTree, body) // while (true) do { body }
-    DefDef(methodSymbol, initBlock(discardDef :: mainLoop :: Nil))
-  }
-
-  /** Create a threadsafe lazy accessor equivalent to such code
-    * ```
-    * def methodSymbol(): Int = {
-    *   while (true) {
-    *     val flag = LazyVals.get(this, bitmap_offset)
-    *     val state = LazyVals.STATE(flag, <field-id>)
-    *
-    *     if (state == <state-3>) {
-    *       return value_0
-    *     } else if (state == <state-0>) {
-    *       if (LazyVals.CAS(this, bitmap_offset, flag, <state-1>, <field-id>)) {
-    *         try {
-    *           val result = <RHS>
-    *           value_0 = result
-    *           nullable = null
-    *           LazyVals.setFlag(this, bitmap_offset, <state-3>, <field-id>)
-    *           return result
-    *         }
-    *         catch {
-    *           case ex =>
-    *             LazyVals.setFlag(this, bitmap_offset, <state-0>, <field-id>)
-    *             throw ex
-    *         }
-    *       }
-    *     } else /* if (state == <state-1> || state == <state-2>) */ {
-    *       LazyVals.wait4Notification(this, bitmap_offset, flag, <field-id>)
-    *     }
-    *   }
-    * }
-    * ```
-    */
-  @deprecated("a newer scheme is now used") // TODO: remove dead code
-  def mkThreadSafeDef_old(methodSymbol: TermSymbol,
-                      claz: ClassSymbol,
-                      ord: Int,
-                      target: Symbol,
-                      rhs: Tree,
-                      tp: Type,
-                      offset: Tree,
-                      getFlag: Tree,
-                      stateMask: Tree,
-                      casFlag: Tree,
-                      setFlagState: Tree,
-                      waitOnLock: Tree)(using Context): DefDef = {
-    val initState = Literal(Constant(0))
-    val computeState = Literal(Constant(1))
-    val computedState = Literal(Constant(3))
-
-    val thiz = This(claz)
-    val fieldId = Literal(Constant(ord))
-
-    val flagSymbol = newSymbol(methodSymbol, lazyNme.flag, Synthetic, defn.LongType)
-    val flagDef = ValDef(flagSymbol, getFlag.appliedTo(thiz, offset))
-    val flagRef = ref(flagSymbol)
-
-    val stateSymbol = newSymbol(methodSymbol, lazyNme.state, Synthetic, defn.LongType)
-    val stateDef = ValDef(stateSymbol, stateMask.appliedTo(ref(flagSymbol), Literal(Constant(ord))))
-    val stateRef = ref(stateSymbol)
-
-    val compute = {
-      val resultSymbol = newSymbol(methodSymbol, lazyNme.result, Synthetic, tp)
-      val resultRef = ref(resultSymbol)
-      val stats = (
-        ValDef(resultSymbol, rhs) ::
-        ref(target).becomes(resultRef) ::
-        (nullOut(nullableFor(methodSymbol)) :+
-        setFlagState.appliedTo(thiz, offset, computedState, fieldId))
-      )
-      Block(stats, Return(resultRef, methodSymbol))
-    }
-
-    val retryCase = {
-      val caseSymbol = newSymbol(methodSymbol, nme.DEFAULT_EXCEPTION_NAME, Synthetic | Case, defn.ThrowableType)
-      val triggerRetry = setFlagState.appliedTo(thiz, offset, initState, fieldId)
-      CaseDef(
-        Bind(caseSymbol, ref(caseSymbol)),
-        EmptyTree,
-        Block(List(triggerRetry), Throw(ref(caseSymbol)))
-      )
-    }
-
-    val initialize = If(
-      casFlag.appliedTo(thiz, offset, flagRef, computeState, fieldId),
-      Try(compute, List(retryCase), EmptyTree),
-      unitLiteral
-    )
-
-    val condition = If(
-      stateRef.equal(computedState),
-      Return(ref(target), methodSymbol),
+    val current = newSymbol(methodSymbol, lazyNme.current, Synthetic, defn.ObjectType)
+    val ifNotNull =
       If(
-        stateRef.equal(initState),
-        initialize,
-        waitOnLock.appliedTo(thiz, offset, flagRef, fieldId)
+        ref(current).select(defn.Any_isInstanceOf).appliedToType(tp),
+        Return(ref(current).ensureConforms(tp), methodSymbol),
+        // not an A
+        If(
+          ref(current).select(defn.Any_isInstanceOf).appliedToTypeTree(nullValued),
+          Return(defaultValue(tp), methodSymbol),
+          // not a NULL
+          If(
+            ref(current).select(defn.Any_isInstanceOf).appliedToTypeTree(waiting),
+            ref(current).select(defn.Any_asInstanceOf).appliedToTypeTree(waiting).select(lazyNme.RLazyVals.waitingAwaitRelease).ensureApplied,
+            // not a Waiting, then is an Evaluating
+            ref(discardSymb).ensureApplied
+          )
+        )
       )
-    )
-
-    val loop = WhileDo(EmptyTree, Block(List(flagDef, stateDef), condition))
-    DefDef(methodSymbol, loop)
+    val body = initBlock(ValDef(current, ref(target)) :: If(ref(target).equal(nullLiteral), unevaluated, ifNotNull) :: Nil)
+    val mainLoop = WhileDo(EmptyTree, body) // while (true) do { body }
+    val ret = DefDef(methodSymbol, initBlock(discardDef :: mainLoop :: Nil))
+    ret
   }
 
   def transformMemberDefThreadSafe(x: ValOrDefDef)(using Context): Thicket = {
@@ -583,7 +482,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     val containerSymbol = newSymbol(claz, containerName, x.symbol.flags &~ containerFlagsMask | containerFlags, defn.ObjectType, coord = x.symbol.coord).enteredAfter(this)
     containerSymbol.addAnnotation(defn.VolatileAnnot) // private @volatile var _x: AnyRef
 
-    val containerTree = ValDef(containerSymbol, defaultValue(claz.typeRef))
+    val containerTree = ValDef(containerSymbol, nullLiteral)
 
     val waiting = requiredClass(s"$runtimeModule.${lazyNme.RLazyVals.waiting}")
     val evaluating = Select(ref(helperModule), lazyNme.RLazyVals.evaluating)
@@ -592,7 +491,8 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     val offset = ref(offsetSymbol)
     val wait   = Select(ref(helperModule), lazyNme.RLazyVals.wait4Notification)
 
-    val accessor = mkThreadSafeDef(x.symbol.asTerm, claz, containerSymbol, x.rhs, tpe, offset, objCas, ref(waiting), evaluating, nullValued)
+    val methodSymbol = x.symbol.asTerm
+    val accessor = mkThreadSafeDef(methodSymbol, claz, containerSymbol, x.rhs, tpe, offset, objCas, ref(waiting), evaluating, nullValued)
     // TODO: remove the extra flag field (unused in the new scheme)
     if (flag eq EmptyTree)
       Thicket(containerTree, accessor)
