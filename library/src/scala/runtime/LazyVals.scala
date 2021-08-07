@@ -148,6 +148,13 @@ object LazyVals {
     r
   }
 
+  def getStaticOffset(clz: Class[_], name: String): Long = {
+    val r = unsafe.staticFieldOffset(clz.getDeclaredField(name))
+    if (true)
+      println(s"getStaticOffset($clz, $name) = $r")
+    r
+  }
+
   object Names {
     final val waiting = "Waiting"
     final val evaluating = "Evaluating"
@@ -161,5 +168,6 @@ object LazyVals {
     final val wait4Notification = "wait4Notification"
     final val get = "get"
     final val getOffset = "getOffset"
+    final val getStaticOffset = "getStaticOffset"
   }
 }

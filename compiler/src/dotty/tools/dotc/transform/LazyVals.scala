@@ -70,7 +70,6 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
   override def transformDefDef(tree: DefDef)(using Context): Tree =
    transformLazyVal(tree)
 
-
   override def transformValDef(tree: ValDef)(using Context): Tree =
     transformLazyVal(tree)
 
@@ -109,7 +108,6 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     }
   }
 
-
   /** Append offset fields to companion objects
     */
   override def transformTemplate(template: Template)(using Context): Tree = {
@@ -123,16 +121,15 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     }
   }
 
-
   private def addInFront(prefix: List[Tree], stats: List[Tree]) = stats match {
     case first :: rest if isSuperConstrCall(first) => first :: prefix ::: rest
     case _ => prefix ::: stats
   }
 
-  /** Make an eager val that would implement synthetic module.
-    * Eager val ensures thread safety and has less code generated.
-    *
-    */
+  /** 
+   * Make an eager val that would implement synthetic module.
+   * Eager val ensures thread safety and has less code generated.
+   */
   def transformSyntheticModule(tree: ValOrDefDef)(using Context): Thicket = {
     val sym = tree.symbol
     val holderSymbol = newSymbol(sym.owner, LazyLocalName.fresh(sym.asTerm.name),
@@ -142,7 +139,8 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     Thicket(field, getter)
   }
 
-  /** Desugar a local `lazy val x: Int = <RHS>` into:
+  /** 
+   * Desugar a local `lazy val x: Int = <RHS>` into:
    *
    *  ```
    *  val x$lzy = new scala.runtime.LazyInt()
@@ -193,7 +191,6 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     report.debuglog(s"found a lazy val ${x.show},\nrewrote with ${holderTree.show}")
     Thicket(holderTree, initTree, accessor)
   }
-
 
   override def transformStats(trees: List[tpd.Tree])(using Context): List[Tree] = {
     // backend requires field usage to be after field definition
@@ -367,8 +364,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
                       evaluating: Tree,
                       nullValued: Tree)(using Context): DefDef = {
     val thiz = This(claz)
-    // TODO: generate names to avoid conflicts
-    val discardSymb = newSymbol(methodSymbol, "discard".toTermName, Method | Synthetic, MethodType(Nil)(_ => Nil, _ => defn.UnitType))
+    val discardSymb = newSymbol(methodSymbol, lazyNme.discard, Method | Synthetic, MethodType(Nil)(_ => Nil, _ => defn.UnitType))
     val discardDef = DefDef(discardSymb, initBlock(
       objCasFlag.appliedTo(thiz, offset, evaluating, Select(New(waiting), StdNames.nme.CONSTRUCTOR).ensureApplied)
         :: Return(unitLiteral, discardSymb) :: Nil))
@@ -403,13 +399,13 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
         initBlock(ValDef(resSymb, nullLiteral) // var result: AnyRef = null
           :: evaluate // try ... finally ...
           :: Nil),
-        EmptyTree
+        EmptyTree // TODO: The loop enters this portion on the second iteration, each time, => wrong field updates
       ).withType(defn.UnitType)
     }
     val current = newSymbol(methodSymbol, lazyNme.current, Synthetic, defn.ObjectType)
     val ifNotNull =
       If(
-        ref(current).select(defn.Any_isInstanceOf).appliedToType(tp),
+        ref(current).select(defn.Any_isInstanceOf).appliedToType(if needsBoxing(tp) then boxIfCan(tp) else tp),
         Return(ref(current).ensureConforms(tp), methodSymbol),
         // not an A
         If(
@@ -424,10 +420,9 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
           )
         )
       )
-    val body = initBlock(ValDef(current, ref(target)) :: If(ref(target).equal(nullLiteral), unevaluated, ifNotNull) :: Nil)
+    val body = initBlock(ValDef(current, ref(target)) :: If(ref(current).equal(nullLiteral), unevaluated, ifNotNull) :: Nil)
     val mainLoop = WhileDo(EmptyTree, body) // while (true) do { body }
-    val ret = DefDef(methodSymbol, initBlock(discardDef :: mainLoop :: Nil))
-    ret
+    DefDef(methodSymbol, initBlock(discardDef :: mainLoop :: Nil))
   }
 
   def transformMemberDefThreadSafe(x: ValOrDefDef)(using Context): Thicket = {
@@ -440,11 +435,17 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     val thizClass = Literal(Constant(claz.info))
     val helperModule = requiredModule(runtimeModule)
     val getOffset = Select(ref(helperModule), lazyNme.RLazyVals.getOffset)
+    val staticOff = Select(ref(helperModule), lazyNme.RLazyVals.getStaticOffset)
     var offsetSymbol: TermSymbol = null
-    var flag: Tree = EmptyTree
     var ord = 0
 
     def offsetName(id: Int) = s"${StdNames.nme.LAZY_FIELD_OFFSET}${if (x.symbol.owner.is(Module)) "_m_" else ""}$id".toTermName
+
+    val containerName = LazyLocalName.fresh(x.name.asTermName)
+    val containerSymbol = newSymbol(claz, containerName, x.symbol.flags &~ containerFlagsMask | containerFlags, defn.ObjectType, coord = x.symbol.coord).enteredAfter(this)
+    containerSymbol.addAnnotation(Annotation(defn.VolatileAnnot)) // private @volatile var _x: AnyRef
+    val containerTree = ValDef(containerSymbol, nullLiteral)
+    def staticOrFieldOff: Tree = (if x.symbol.isStatic then staticOff else getOffset).appliedTo(thizClass, Literal(Constant(containerName.toString)))
 
     // compute or create appropriate offsetSymbol, bitmap and bits used by current ValDef
     appendOffsetDefs.get(claz) match {
@@ -461,42 +462,26 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
         else { // need to create a new flag
           offsetSymbol = newSymbol(claz, offsetById, Synthetic, defn.LongType).enteredAfter(this)
           offsetSymbol.addAnnotation(Annotation(defn.ScalaStaticAnnot))
-          val flagName = LazyBitMapName.fresh(id.toString.toTermName)
-          val flagSymbol = newSymbol(claz, flagName, containerFlags, defn.LongType).enteredAfter(this)
-          flag = ValDef(flagSymbol, Literal(Constant(0L)))
-          val offsetTree = ValDef(offsetSymbol, getOffset.appliedTo(thizClass, Literal(Constant(flagName.toString))))
+          val offsetTree = ValDef(offsetSymbol, staticOrFieldOff)
           info.defs = offsetTree :: info.defs
         }
 
       case None =>
         offsetSymbol = newSymbol(claz, offsetName(0), Synthetic, defn.LongType).enteredAfter(this)
         offsetSymbol.addAnnotation(Annotation(defn.ScalaStaticAnnot))
-        val flagName = LazyBitMapName.fresh("0".toTermName)
-        val flagSymbol = newSymbol(claz, flagName, containerFlags, defn.LongType).enteredAfter(this)
-        flag = ValDef(flagSymbol, Literal(Constant(0L)))
-        val offsetTree = ValDef(offsetSymbol, getOffset.appliedTo(thizClass, Literal(Constant(flagName.toString))))
+        val offsetTree = ValDef(offsetSymbol, staticOrFieldOff)
         appendOffsetDefs += (claz -> new OffsetInfo(List(offsetTree), ord))
     }
-
-    val containerName = LazyLocalName.fresh(x.name.asTermName)
-    val containerSymbol = newSymbol(claz, containerName, x.symbol.flags &~ containerFlagsMask | containerFlags, defn.ObjectType, coord = x.symbol.coord).enteredAfter(this)
-    containerSymbol.addAnnotation(defn.VolatileAnnot) // private @volatile var _x: AnyRef
-
-    val containerTree = ValDef(containerSymbol, nullLiteral)
 
     val waiting = requiredClass(s"$runtimeModule.${lazyNme.RLazyVals.waiting}")
     val evaluating = Select(ref(helperModule), lazyNme.RLazyVals.evaluating)
     val nullValued = Select(ref(helperModule), lazyNme.RLazyVals.nullValued)
     val objCas = Select(ref(helperModule), lazyNme.RLazyVals.objCas)
     val offset = ref(offsetSymbol)
-    val wait   = Select(ref(helperModule), lazyNme.RLazyVals.wait4Notification)
 
     val methodSymbol = x.symbol.asTerm
     val accessor = mkThreadSafeDef(methodSymbol, claz, containerSymbol, x.rhs, tpe, offset, objCas, ref(waiting), evaluating, nullValued)
-    // TODO: remove the extra flag field (unused in the new scheme)
-    if (flag eq EmptyTree)
-      Thicket(containerTree, accessor)
-    else Thicket(containerTree, flag, accessor)
+    Thicket(containerTree, accessor)
   }
 }
 
@@ -513,12 +498,8 @@ object LazyVals {
       val evaluating: TermName        = N.evaluating.toTermName
       val nullValued: TermName        = N.nullValued.toTermName
       val objCas: TermName            = N.objCas.toTermName
-      val get: TermName               = N.get.toTermName
-      val setFlag: TermName           = N.setFlag.toTermName
-      val wait4Notification: TermName = N.wait4Notification.toTermName
-      val state: TermName             = N.state.toTermName
-      val cas: TermName               = N.cas.toTermName
       val getOffset: TermName         = N.getOffset.toTermName
+      val getStaticOffset: TermName   = N.getStaticOffset.toTermName
     }
     val flag: TermName        = "flag".toTermName
     val state: TermName       = "state".toTermName
@@ -529,5 +510,6 @@ object LazyVals {
     val retry: TermName       = "retry".toTermName
     val current: TermName     = "current".toTermName
     val lock: TermName        = "lock".toTermName
+    val discard: TermName     = "discard".toTermName
   }
 }
