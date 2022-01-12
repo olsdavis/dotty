@@ -1,5 +1,7 @@
 package scala.runtime
 
+import java.lang.reflect.Modifier
+
 /**
  * Helper methods used in thread-safe lazy vals.
  */
@@ -142,15 +144,18 @@ object LazyVals {
   }
 
   def getOffset(clz: Class[_], name: String): Long = {
-    val r = unsafe.objectFieldOffset(clz.getDeclaredField(name))
     if (debug)
-      println(s"getOffset($clz, $name) = $r")
-    r
+      clz.getDeclaredFields.foreach(println(_))
+    val field = clz.getDeclaredField(name)
+    if java.lang.reflect.Modifier.isStatic(field.getModifiers()) then
+      unsafe.staticFieldOffset(field)
+    else
+      unsafe.objectFieldOffset(field)
   }
 
   def getStaticOffset(clz: Class[_], name: String): Long = {
     val r = unsafe.staticFieldOffset(clz.getDeclaredField(name))
-    if (true)
+    if (debug)
       println(s"getStaticOffset($clz, $name) = $r")
     r
   }
