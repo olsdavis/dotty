@@ -23,9 +23,10 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
   import LazyVals._
   import tpd._
 
-  /** this map contains mutable state of transformation: OffsetDefs to be appended to companion object definitions,
-    * and number of bits currently used */
-  class OffsetInfo(var defs: List[Tree], var ord:Int)
+  /**
+   * The map contains the list of the offset trees.
+   */
+  class OffsetInfo(var defs: List[Tree])
   private val appendOffsetDefs = mutable.Map.empty[Symbol, OffsetInfo]
 
   override def phaseName: String = LazyVals.name
@@ -292,6 +293,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
    *            var result: AnyRef = null // here, we need `AnyRef` to possibly assign `NULL`
    *            try
    *                result = rhs
+   *                nullable = null // if the field is nullable; see `CollectNullableFields`
    *                if result == null then result = NULL // drop if A is non-nullable
    *            finally
    *                if !CAS(_x, Evaluating, result) then
@@ -323,6 +325,7 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
    *         var result: AnyRef = null
    *         try
    *           result = rhs
+   *           nullable = null
    *           if result == null then result = NULL
    *         finally
    *           if !CAS(_x, Evaluating, result) then
@@ -387,9 +390,12 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
       ).withType(defn.UnitType)
       // entire try block
       val evaluate = Try(
-        initBlock(Assign(ref(resSymb), if needsBoxing(tp) && rhs != EmptyTree then rhs.ensureConforms(boxIfCan(tp)) else rhs) // try result = rhs
-          :: If(ref(resSymb).equal(nullLiteral), Assign(ref(resSymb), nullValued), EmptyTree).withType(defn.UnitType) // if result == null then result = NULL
-          :: Nil),
+        initBlock(
+          Assign(ref(resSymb), if needsBoxing(tp) && rhs != EmptyTree then rhs.ensureConforms(boxIfCan(tp)) else rhs) // try result = rhs
+          :: nullOut(nullableFor(methodSymbol))
+          ::: If(ref(resSymb).equal(nullLiteral), Assign(ref(resSymb), nullValued), EmptyTree).withType(defn.UnitType) // if result == null then result = NULL
+          :: Nil
+        ),
         Nil,
         fin
       )
@@ -438,7 +444,6 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     val helperModule = requiredModule(runtimeModule)
     val getOffset = Select(ref(helperModule), lazyNme.RLazyVals.getOffset)
     var offsetSymbol: TermSymbol = null
-    var ord = 0
 
     def offsetName(id: Int) = s"${StdNames.nme.LAZY_FIELD_OFFSET}${if (x.symbol.owner.is(Module)) "_m_" else ""}$id".toTermName
 
@@ -451,31 +456,18 @@ class LazyVals extends MiniPhase with IdentityDenotTransformer {
     val containerTree = ValDef(containerSymbol, nullLiteral)
     def staticOrFieldOff: Tree = getOffset.appliedTo(thizClass, Literal(Constant(containerName.toString)))
 
-    // compute or create appropriate offsetSymbol, bitmap and bits used by current ValDef
-    appendOffsetDefs.get(claz) match {
+    // create an offset for this lazy val
+    appendOffsetDefs.get(claz) match
       case Some(info) =>
-        val flagsPerLong = (64 / scala.runtime.LazyVals.BITS_PER_LAZY_VAL).toInt
-        info.ord += 1
-        ord = info.ord % flagsPerLong
-        val id = info.ord / flagsPerLong
-        val offsetById = offsetName(id)
-        if (ord != 0) // there are unused bits in already existing flag
-          offsetSymbol = claz.info.decl(offsetById)
-            .suchThat(sym => sym.is(Synthetic) && sym.isTerm)
-             .symbol.asTerm
-        else { // need to create a new flag
-          offsetSymbol = newSymbol(claz, offsetById, Synthetic, defn.LongType).enteredAfter(this)
-          offsetSymbol.addAnnotation(Annotation(defn.ScalaStaticAnnot))
-          val offsetTree = ValDef(offsetSymbol, staticOrFieldOff)
-          info.defs = offsetTree :: info.defs
-        }
-
+        offsetSymbol = newSymbol(claz, offsetName(info.defs.size), Synthetic, defn.LongType).enteredAfter(this)
+        offsetSymbol.addAnnotation(Annotation(defn.ScalaStaticAnnot))
+        val offsetTree = ValDef(offsetSymbol, staticOrFieldOff)
+        info.defs = offsetTree :: info.defs
       case None =>
         offsetSymbol = newSymbol(claz, offsetName(0), Synthetic, defn.LongType).enteredAfter(this)
         offsetSymbol.addAnnotation(Annotation(defn.ScalaStaticAnnot))
         val offsetTree = ValDef(offsetSymbol, staticOrFieldOff)
-        appendOffsetDefs += (claz -> new OffsetInfo(List(offsetTree), ord))
-    }
+        appendOffsetDefs += (claz -> new OffsetInfo(List(offsetTree)))
 
     val waiting = requiredClass(s"$runtimeModule.${lazyNme.RLazyVals.waiting}")
     val evaluating = Select(ref(helperModule), lazyNme.RLazyVals.evaluating)
