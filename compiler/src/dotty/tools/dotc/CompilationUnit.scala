@@ -56,9 +56,6 @@ class CompilationUnit protected (val source: SourceFile) {
    */
   var needsQuotePickling: Boolean = false
 
-  /** A structure containing a temporary map for generating inline accessors */
-  val inlineAccessors: InlineAccessors = new InlineAccessors
-
   var suspended: Boolean = false
   var suspendedAtInliningPhase: Boolean = false
 
@@ -125,7 +122,7 @@ object CompilationUnit {
         NoSource
       }
       else if (!source.file.exists) {
-        report.error(s"not found: ${source.file.path}")
+        report.error(s"source file not found: ${source.file.path}")
         NoSource
       }
       else source

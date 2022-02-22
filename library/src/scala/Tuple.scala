@@ -1,5 +1,6 @@
 package scala
-import annotation.showAsInfix
+
+import annotation.{experimental, showAsInfix, since}
 import compiletime._
 import compiletime.ops.int._
 
@@ -7,18 +8,23 @@ import compiletime.ops.int._
 sealed trait Tuple extends Product {
   import Tuple._
 
-  /** Create a copy this tuple as an Array */
+  /** Create a copy of this tuple as an Array */
   inline def toArray: Array[Object] =
     runtime.Tuples.toArray(this)
 
-  /** Create a copy this tuple as a List */
+  /** Create a copy of this tuple as a List */
   inline def toList: List[Union[this.type]] =
     this.productIterator.toList
       .asInstanceOf[List[Union[this.type]]]
 
-  /** Create a copy this tuple as an IArray */
+  /** Create a copy of this tuple as an IArray */
   inline def toIArray: IArray[Object] =
     runtime.Tuples.toIArray(this)
+
+  /** Return a copy of `this` tuple with an element appended */
+  @experimental
+  inline def :* [This >: this.type <: Tuple, L] (x: L): Append[This, L] =
+    runtime.Tuples.append(x, this).asInstanceOf[Append[This, L]]
 
   /** Return a new tuple by prepending the element to `this` tuple.
    *  This operation is O(this.size)
@@ -77,14 +83,36 @@ sealed trait Tuple extends Product {
 
 object Tuple {
 
+  /** Type of a tuple with an element appended */
+  @experimental
+  type Append[X <: Tuple, Y] <: Tuple = X match {
+    case EmptyTuple => Y *: EmptyTuple
+    case x *: xs => x *: Append[xs, Y]
+  }
+
   /** Type of the head of a tuple */
   type Head[X <: NonEmptyTuple] = X match {
     case x *: _ => x
   }
 
+  /** Type of the initial part of the tuple without its last element */
+  @experimental
+  type Init[X <: Tuple] <: Tuple = X match {
+    case _ *: EmptyTuple => EmptyTuple
+    case x *: xs =>
+      x *: Init[xs]
+  }
+
   /** Type of the tail of a tuple */
   type Tail[X <: NonEmptyTuple] <: Tuple = X match {
     case _ *: xs => xs
+  }
+
+  /** Type of the last element of a tuple */
+  @experimental
+  type Last[X <: Tuple] = X match {
+    case x *: EmptyTuple => x
+    case _ *: xs => Last[xs]
   }
 
   /** Type of the concatenation of two tuples */
@@ -212,18 +240,17 @@ object Tuple {
       case xs: Array[Object] => xs
       case xs => xs.map(_.asInstanceOf[Object])
     }
-    runtime.Tuples.fromArray(xs2).asInstanceOf[Tuple]
+    runtime.Tuples.fromArray(xs2)
   }
 
   /** Convert an immutable array into a tuple of unknown arity and types */
   def fromIArray[T](xs: IArray[T]): Tuple = {
     val xs2: IArray[Object] = xs match {
       case xs: IArray[Object] @unchecked => xs
-      case xs =>
-        // TODO support IArray.map
-        xs.asInstanceOf[Array[T]].map(_.asInstanceOf[Object]).asInstanceOf[IArray[Object]]
+      case _ =>
+        xs.map(_.asInstanceOf[Object])
     }
-    runtime.Tuples.fromIArray(xs2).asInstanceOf[Tuple]
+    runtime.Tuples.fromIArray(xs2)
   }
 
   /** Convert a Product into a tuple of unknown arity and types */
@@ -232,6 +259,13 @@ object Tuple {
 
   def fromProductTyped[P <: Product](p: P)(using m: scala.deriving.Mirror.ProductOf[P]): m.MirroredElemTypes =
     runtime.Tuples.fromProduct(p).asInstanceOf[m.MirroredElemTypes]
+
+  @since("3.1")
+  given canEqualEmptyTuple: CanEqual[EmptyTuple, EmptyTuple] = CanEqual.derived
+  @since("3.1")
+  given canEqualTuple[H1, T1 <: Tuple, H2, T2 <: Tuple](
+    using eqHead: CanEqual[H1, H2], eqTail: CanEqual[T1, T2]
+  ): CanEqual[H1 *: T1, H2 *: T2] = CanEqual.derived
 }
 
 /** A tuple of 0 elements */
@@ -263,6 +297,16 @@ sealed trait NonEmptyTuple extends Tuple {
   /** Get the head of this tuple */
   inline def head[This >: this.type <: NonEmptyTuple]: Head[This] =
     runtime.Tuples.apply(this, 0).asInstanceOf[Head[This]]
+
+  /** Get the initial part of the tuple without its last element */
+  @experimental
+  inline def init[This >: this.type <: NonEmptyTuple]: Init[This] =
+    runtime.Tuples.init(this).asInstanceOf[Init[This]]
+
+  /** Get the last of this tuple */
+  @experimental
+  inline def last[This >: this.type <: NonEmptyTuple]: Last[This] =
+    runtime.Tuples.last(this).asInstanceOf[Last[This]]
 
   /** Get the tail of this tuple.
    *  This operation is O(this.size)

@@ -10,15 +10,16 @@ lower case letter*_ are for explanation of semantic content only, they
 can be dropped without changing the grammar.
 
 Micro-syntax:
-
+```none
   LongInt       = Digit* StopDigit        -- big endian 2's complement, value fits in a Long w/o overflow
   Int           = LongInt                 -- big endian 2's complement, fits in an Int w/o overflow
   Nat           = LongInt                 -- non-negative value, fits in an Int without overflow
   Digit         = 0 | ... | 127
   StopDigit     = 128 | ... | 255         -- value = digit - 128
+```
 
 Macro-format:
-
+```none
   File          = Header majorVersion_Nat minorVersion_Nat experimentalVersion_Nat VersionString UUID
                   nameTable_Length Name* Section*
   Header        = 0x5CA1AB1F
@@ -39,6 +40,7 @@ Macro-format:
                   SUPERACCESSOR     Length underlying_NameRef                               -- super$A
                   INLINEACCESSOR    Length underlying_NameRef                               -- inline$A
                   OBJECTCLASS       Length underlying_NameRef                               -- A$  (name of the module class for module A)
+                  BODYRETAINER      Length underlying_NameRef                               -- A$retainedBody
 
                   SIGNED            Length original_NameRef resultSig_NameRef ParamSig*     -- name + signature
                   TARGETSIGNED      Length original_NameRef target_NameRef resultSig_NameRef ParamSig*
@@ -47,13 +49,14 @@ Macro-format:
                       // If positive, this is a NameRef for the fully qualified name of a term parameter.
 
   NameRef       = Nat                    // ordinal number of name in name table, starting from 1.
+```
 
 Note: Unqualified names in the name table are strings. The context decides whether a name is
 a type-name or a term-name. The same string can represent both.
 
 
 Standard-Section: "ASTs" TopLevelStat*
-
+```none
   TopLevelStat  = PACKAGE        Length Path TopLevelStat*                         -- package path { topLevelStats }
                   Stat
 
@@ -157,7 +160,7 @@ Standard-Section: "ASTs" TopLevelStat*
                   TYPEREFin      Length NameRef qual_Type namespace_Type           -- A reference `qual.name` to a non-local member that's private in `namespace`.
                   RECtype               parent_Type                                -- A wrapper for recursive refined types
                   SUPERtype      Length this_Type underlying_Type                  -- A super type reference to `underlying`
-                  REFINEDtype    Length underlying_Type refinement_NameRef info_Type -- underlying { refinement_name : info }
+                  REFINEDtype    Length refinement_NameRef underlying_Type info_Type -- underlying { refinement_name : info }
                   APPLIEDtype    Length tycon_Type arg_Type*                       -- tycon[args]
                   TYPEBOUNDS     Length lowOrAlias_Type high_Type? Variance*       -- = alias or >: low <: high, possibly with variances of lambda parameters
                   ANNOTATEDtype  Length underlying_Type annotation_Term            -- underlying @ annotation
@@ -219,22 +222,23 @@ Standard-Section: "ASTs" TopLevelStat*
                 | CONTRAVARIANT
 
   Annotation    = ANNOTATION     Length tycon_Type fullAnnotation_Term             -- An annotation, given (class) type of constructor, and full application tree
+```
 
 Note: The signature of a SELECTin or TERMREFin node is the signature of the selected symbol,
       not the signature of the reference. The latter undergoes an asSeenFrom but the former
       does not.
 
 Note: Tree tags are grouped into 5 categories that determine what follows, and thus allow to compute the size of the tagged tree in a generic way.
-
+```none
   Category 1 (tags 1-59)   :  tag
   Category 2 (tags 60-89)  :  tag Nat
   Category 3 (tags 90-109) :  tag AST
   Category 4 (tags 110-127):  tag Nat AST
   Category 5 (tags 128-255):  tag Length <payload>
-
+```
 
 Standard-Section: "Positions" LinesSizes Assoc*
-
+```none
   LinesSizes    = Nat Nat*                 // Number of lines followed by the size of each line not counting the trailing `\n`
 
   Assoc         = Header offset_Delta? offset_Delta? point_Delta?
@@ -250,15 +254,17 @@ Standard-Section: "Positions" LinesSizes Assoc*
   SOURCE        = 4                         // Impossible as header, since addr_Delta = 0 implies that we refer to the
                                             // same tree as the previous one, but then hasStartDiff = 1 implies that
                                             // the tree's range starts later than the range of itself.
+```
 
 All elements of a position section are serialized as Ints
 
 
 Standard Section: "Comments" Comment*
-
+```none
   Comment       = Length Bytes LongInt      // Raw comment's bytes encoded as UTF-8, followed by the comment's coordinates.
+```
 
-
+* @syntax markdown
 **************************************************************************************/
 
 object TastyFormat {
@@ -271,34 +277,34 @@ object TastyFormat {
     */
   final val header: Array[Int] = Array(0x5C, 0xA1, 0xAB, 0x1F)
 
-  /**Natural number. Each increment of the `MajorVersion` begins a
-   * new series of backward compatible TASTy versions.
+  /** Natural number. Each increment of the `MajorVersion` begins a
+   *  new series of backward compatible TASTy versions.
    *
-   * A TASTy file in either the preceeding or succeeding series is
-   * incompatible with the current value.
+   *  A TASTy file in either the preceeding or succeeding series is
+   *  incompatible with the current value.
    */
   final val MajorVersion: Int = 28
 
-  /**Natural number. Each increment of the `MinorVersion`, within
-   * a series declared by the `MajorVersion`, breaks forward
-   * compatibility, but remains backwards compatible, with all
-   * preceeding `MinorVersion`.
+  /** Natural number. Each increment of the `MinorVersion`, within
+   *  a series declared by the `MajorVersion`, breaks forward
+   *  compatibility, but remains backwards compatible, with all
+   *  preceeding `MinorVersion`.
    */
-  final val MinorVersion: Int = 1
+  final val MinorVersion: Int = 2
 
-  /**Natural Number. The `ExperimentalVersion` allows for
-   * experimentation with changes to TASTy without committing
-   * to any guarantees of compatibility.
+  /** Natural Number. The `ExperimentalVersion` allows for
+   *  experimentation with changes to TASTy without committing
+   *  to any guarantees of compatibility.
    *
-   * A zero value indicates that the TASTy version is from a
-   * stable, final release.
+   *  A zero value indicates that the TASTy version is from a
+   *  stable, final release.
    *
-   * A strictly positive value indicates that the TASTy
-   * version is experimental. An experimental TASTy file
-   * can only be read by a tool with the same version.
-   * However, tooling with an experimental TASTy version
-   * is able to read final TASTy documents if the file's
-   * `MinorVersion` is strictly less than the current value.
+   *  A strictly positive value indicates that the TASTy
+   *  version is experimental. An experimental TASTy file
+   *  can only be read by a tool with the same version.
+   *  However, tooling with an experimental TASTy version
+   *  is able to read final TASTy documents if the file's
+   *  `MinorVersion` is strictly less than the current value.
    */
   final val ExperimentalVersion: Int = 1
 
@@ -327,29 +333,12 @@ object TastyFormat {
    * with an unstable TASTy version.
    *
    * We follow the given algorithm:
+   *
    * ```
-   * if file.major != compiler.major then
-   *   return incompatible
-   * if compiler.experimental == 0 then
-   *   if file.experimental != 0 then
-   *     return incompatible
-   *   if file.minor > compiler.minor then
-   *     return incompatible
-   *   else
-   *     return compatible
-   * else invariant[compiler.experimental != 0]
-   *   if file.experimental == compiler.experimental then
-   *     if file.minor == compiler.minor then
-   *       return compatible (all fields equal)
-   *     else
-   *       return incompatible
-   *   else if file.experimental == 0,
-   *     if file.minor < compiler.minor then
-   *       return compatible (an experimental version can read a previous released version)
-   *     else
-   *       return incompatible (an experimental version cannot read its own minor version or any later version)
-   *   else invariant[file.experimental is non-0 and different than compiler.experimental]
-   *     return incompatible
+   * (fileMajor, fileMinor, fileExperimental) match
+   *   case (`compilerMajor`, `compilerMinor`, `compilerExperimental`) => true // full equality
+   *   case (`compilerMajor`, minor, 0) if minor < compilerMinor       => true // stable backwards compatibility
+   *   case _                                                          => false
    * ```
    * @syntax markdown
    */
@@ -361,18 +350,9 @@ object TastyFormat {
     compilerMinor: Int,
     compilerExperimental: Int
   ): Boolean = (
-    fileMajor == compilerMajor && (
-      if (fileExperimental == compilerExperimental) {
-        if (compilerExperimental == 0) {
-          fileMinor <= compilerMinor
-        }
-        else {
-          fileMinor == compilerMinor
-        }
-      }
-      else {
-        fileExperimental == 0 && fileMinor < compilerMinor
-      }
+    fileMajor == compilerMajor &&
+      (  fileMinor == compilerMinor && fileExperimental == compilerExperimental // full equality
+      || fileMinor <  compilerMinor && fileExperimental == 0 // stable backwards compatibility
     )
   )
 

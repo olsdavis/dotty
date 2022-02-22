@@ -10,6 +10,7 @@ import dotty.tools.dotc.core.Contexts.Context
 import dotty.tools.dotc.core.Mode
 import dotty.tools.dotc.core.Phases.Phase
 import dotty.tools.dotc.fromtasty._
+import dotty.tools.dotc.quoted.QuotesCache
 import dotty.tools.dotc.util.ClasspathFromClassloader
 import dotty.tools.dotc.CompilationUnit
 import dotty.tools.unsupported
@@ -22,6 +23,8 @@ object TastyInspector:
   /** Load and process TASTy files using TASTy reflect
    *
    *  @param tastyFiles List of paths of `.tasty` files
+   *
+   *  @return boolean value indicating whether the process succeeded
    */
   def inspectTastyFiles(tastyFiles: List[String])(inspector: Inspector): Boolean =
     inspectAllTastyFiles(tastyFiles, Nil, Nil)(inspector)
@@ -29,6 +32,8 @@ object TastyInspector:
   /** Load and process TASTy files in a `jar` file using TASTy reflect
    *
    *  @param jars Path of `.jar` file
+   *
+   *  @return boolean value indicating whether the process succeeded
    */
   def inspectTastyFilesInJar(jar: String)(inspector: Inspector): Boolean =
     inspectAllTastyFiles(Nil, List(jar), Nil)(inspector)
@@ -38,6 +43,8 @@ object TastyInspector:
    *  @param tastyFiles List of paths of `.tasty` files
    *  @param jars List of path of `.jar` files
    *  @param dependenciesClasspath Classpath with extra dependencies needed to load class in the `.tasty` files
+   *
+   *  @return boolean value indicating whether the process succeeded
    */
   def inspectAllTastyFiles(tastyFiles: List[String], jars: List[String], dependenciesClasspath: List[String])(inspector: Inspector): Boolean =
     def checkFile(fileName: String, ext: String): Unit =
@@ -49,7 +56,7 @@ object TastyInspector:
     tastyFiles.foreach(checkFile(_, "tasty"))
     jars.foreach(checkFile(_, "jar"))
     val files = tastyFiles ::: jars
-    files.nonEmpty && inspectFiles(dependenciesClasspath, files)(inspector)
+    inspectFiles(dependenciesClasspath, files)(inspector)
 
   private def inspectorDriver(inspector: Inspector) =
     class InspectorDriver extends Driver:
@@ -58,7 +65,11 @@ object TastyInspector:
     class TastyInspectorPhase extends Phase:
       override def phaseName: String = "tastyInspector"
 
-      override def runOn(units: List[CompilationUnit])(using Context): List[CompilationUnit] =
+      override def runOn(units: List[CompilationUnit])(using ctx0: Context): List[CompilationUnit] =
+        val ctx = QuotesCache.init(ctx0.fresh)
+        runOnImpl(units)(using ctx)
+
+      private def runOnImpl(units: List[CompilationUnit])(using Context): List[CompilationUnit] =
         val quotesImpl = QuotesImpl()
         class TastyImpl(val path: String, val ast: quotesImpl.reflect.Tree) extends Tasty[quotesImpl.type] {
           val quotes = quotesImpl
@@ -100,11 +111,11 @@ object TastyInspector:
 
 
   private def inspectFiles(classpath: List[String], classes: List[String])(inspector: Inspector): Boolean =
-    if (classes.isEmpty)
-      throw new IllegalArgumentException("Parameter classes should no be empty")
-
-    val reporter = inspectorDriver(inspector).process(inspectorArgs(classpath, classes))
-    reporter.hasErrors
+    classes match
+      case Nil => true
+      case _ =>
+        val reporter = inspectorDriver(inspector).process(inspectorArgs(classpath, classes))
+        !reporter.hasErrors
 
   end inspectFiles
 

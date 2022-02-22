@@ -173,6 +173,7 @@ object Applications {
       val elemTp = unapplySeqTypeElemTp(tp)
       if (elemTp.exists) args.map(Function.const(elemTp))
       else if (isProductSeqMatch(tp, args.length, pos)) productSeqSelectors(tp, args.length, pos)
+      else if tp.derivesFrom(defn.NonEmptyTupleClass) then foldApplyTupleType(tp)
       else fallback
     }
 
@@ -189,13 +190,25 @@ object Applications {
         getUnapplySelectors(getTp, args, pos)
       else if (unapplyResult.widenSingleton isRef defn.BooleanClass)
         Nil
-      else if (defn.isProductSubType(unapplyResult))
+      else if (defn.isProductSubType(unapplyResult) && productArity(unapplyResult, pos) != 0)
         productSelectorTypes(unapplyResult, pos)
           // this will cause a "wrong number of arguments in pattern" error later on,
           // which is better than the message in `fail`.
+      else if unapplyResult.derivesFrom(defn.NonEmptyTupleClass) then
+        foldApplyTupleType(unapplyResult)
       else fail
     }
   }
+
+  def foldApplyTupleType(tp: Type)(using Context): List[Type] =
+    object tupleFold extends TypeAccumulator[List[Type]]:
+      override def apply(accum: List[Type], t: Type): List[Type] =
+        t match
+          case AppliedType(tycon, x :: x2 :: Nil) if tycon.typeSymbol == defn.PairClass =>
+            apply(x :: accum, x2)
+          case x => foldOver(accum, x)
+    end tupleFold
+    tupleFold(Nil, tp).reverse
 
   def wrapDefs(defs: mutable.ListBuffer[Tree], tree: Tree)(using Context): Tree =
     if (defs != null && defs.nonEmpty) tpd.Block(defs.toList, tree) else tree
@@ -411,7 +424,7 @@ trait Applications extends Compatibility {
      */
     @threadUnsafe lazy val methType: Type = liftedFunType.widen match {
       case funType: MethodType => funType
-      case funType: PolyType => constrained(funType).resultType
+      case funType: PolyType => instantiateWithTypeVars(funType)
       case tp => tp //was: funType
     }
 
@@ -433,15 +446,18 @@ trait Applications extends Compatibility {
 
     protected def init(): Unit = methType match {
       case methType: MethodType =>
-        // apply the result type constraint, unless method type is dependent
         val resultApprox = resultTypeApprox(methType)
-        if (!constrainResult(methRef.symbol, resultApprox, resultType))
-          if (ctx.typerState.isCommittable)
-            // defer the problem until after the application;
-            // it might be healed by an implicit conversion
-            ()
-          else
-            fail(TypeMismatch(methType.resultType, resultType))
+        val sym = methRef.symbol
+        if ctx.typerState.isCommittable then
+          // Here we call `resultType` only to accumulate constraints (even if
+          // it fails, we might be able to heal the expression to conform to the
+          // result type) so don't check for views since `viewExists` doesn't
+          // have any side-effect and would only slow the compiler down (cf #14333).
+          NoViewsAllowed.constrainResult(sym, resultApprox, resultType)
+        else if !constrainResult(sym, resultApprox, resultType) then
+          // Here we actually record that this alternative failed so that
+          // overloading resolution might prune it.
+          fail(TypeMismatch(methType.resultType, resultType, None))
 
         // match all arguments with corresponding formal parameters
         matchArgs(orderedArgs, methType.paramInfos, 0)
@@ -744,7 +760,10 @@ trait Applications extends Compatibility {
       typedArgBuf += seqToRepeated(SeqLiteral(args, elemtpt))
     }
 
-    def harmonizeArgs(args: List[TypedArg]): List[Tree] = harmonize(args)
+    def harmonizeArgs(args: List[TypedArg]): List[Tree] =
+      // harmonize args only if resType depends on parameter types
+      if (isFullyDefined(methodType.resType, ForceDegree.none)) args
+      else harmonize(args)
 
     override def appPos: SrcPos = app.srcPos
 
@@ -888,15 +907,6 @@ trait Applications extends Compatibility {
         then originalProto.tupledDual
         else originalProto
 
-      // If some of the application's arguments are function literals without explicitly declared
-      // parameter types, relate the normalized result type of the application with the
-      // expected type through `constrainResult`. This can add more constraints which
-      // help sharpen the inferred parameter types for the argument function literal(s).
-      // This tweak is needed to make i1378 compile.
-      if (tree.args.exists(untpd.isFunctionWithUnknownParamType(_)))
-        if (!constrainResult(tree.symbol, fun1.tpe.widen, proto.derivedFunProto(resultType = pt)))
-          typr.println(i"result failure for $tree with type ${fun1.tpe.widen}, expected = $pt")
-
       /** Type application where arguments come from prototype, and no implicits are inserted */
       def simpleApply(fun1: Tree, proto: FunProto)(using Context): Tree =
         methPart(fun1).tpe match {
@@ -914,8 +924,9 @@ trait Applications extends Compatibility {
        *  part. Return an optional value to indicate success.
        */
       def tryWithImplicitOnQualifier(fun1: Tree, proto: FunProto)(using Context): Option[Tree] =
-        if (ctx.mode.is(Mode.SynthesizeExtMethodReceiver))
+        if ctx.mode.is(Mode.SynthesizeExtMethodReceiver) || proto.hasErrorArg then
           // Suppress insertion of apply or implicit conversion on extension method receiver
+          // or if argument is erroneous by itself.
           None
         else
           tryInsertImplicitOnQualifier(fun1, proto, ctx.typerState.ownedVars) flatMap { fun2 =>
@@ -1360,7 +1371,7 @@ trait Applications extends Compatibility {
         for (argType <- argTypes) assert(!isBounds(argType), unapplyApp.tpe.show)
         val bunchedArgs = argTypes match {
           case argType :: Nil =>
-            if (args.lengthCompare(1) > 0 && Feature.autoTuplingEnabled && defn.isTupleType(argType)) untpd.Tuple(args) :: Nil
+            if (args.lengthCompare(1) > 0 && Feature.autoTuplingEnabled && defn.isTupleNType(argType)) untpd.Tuple(args) :: Nil
             else args
           case _ => args
         }
@@ -1568,7 +1579,7 @@ trait Applications extends Compatibility {
             case tp2: MethodType => true // (3a)
             case tp2: PolyType if tp2.resultType.isInstanceOf[MethodType] => true // (3a)
             case tp2: PolyType => // (3b)
-              explore(isAsSpecificValueType(tp1, constrained(tp2).resultType))
+              explore(isAsSpecificValueType(tp1, instantiateWithTypeVars(tp2)))
             case _ => // 3b)
               isAsSpecificValueType(tp1, tp2)
     }
@@ -1628,7 +1639,7 @@ trait Applications extends Compatibility {
     /** Widen the result type of synthetic given methods from the implementation class to the
      *  type that's implemented. Example
      *
-     *      given I[X] as T { ... }
+     *      given I[X]: T with { ... }
      *
      *  This desugars to
      *
@@ -1638,7 +1649,7 @@ trait Applications extends Compatibility {
      *  To compare specificity we should compare with `T`, not with its implementation `I[X]`.
      *  No such widening is performed for given aliases, which are not synthetic. E.g.
      *
-     *      given J[X] as T = rhs
+     *      given J[X]: T = rhs
      *
      *  already has the right result type `T`. Neither is widening performed for given
      *  objects, since these are anyway taken to be more specific than methods
@@ -1649,8 +1660,8 @@ trait Applications extends Compatibility {
         mt.derivedLambdaType(mt.paramNames, mt.paramInfos, widenGiven(mt.resultType, alt))
       case pt: PolyType =>
         pt.derivedLambdaType(pt.paramNames, pt.paramInfos, widenGiven(pt.resultType, alt))
-      case _ =>
-        if (alt.symbol.isAllOf(SyntheticGivenMethod)) tp.widenToParents
+      case rt =>
+        if alt.symbol.isCoDefinedGiven(rt.typeSymbol) then tp.widenToParents
         else tp
     }
 
@@ -1735,7 +1746,7 @@ trait Applications extends Compatibility {
       resultType.revealIgnored match {
         case resultType: ValueType =>
           altType.widen match {
-            case tp: PolyType => resultConforms(altSym, constrained(tp).resultType, resultType)
+            case tp: PolyType => resultConforms(altSym, instantiateWithTypeVars(tp), resultType)
             case tp: MethodType => constrainResult(altSym, tp.resultType, resultType)
             case _ => true
           }

@@ -1,6 +1,6 @@
 package scala
 
-import scala.annotation.experimental
+import scala.annotation.since
 
 /** A marker trait for objects that support structural selection via
  *  `selectDynamic` and `applyDynamic`
@@ -49,6 +49,6 @@ object Selectable:
    *  the additional restriction that the signatures of the refinement and
    *  the definition that implements the refinment must match.
    */
-  @experimental
+  @since("3.1")
   trait WithoutPreciseParameterTypes extends Selectable
 end Selectable

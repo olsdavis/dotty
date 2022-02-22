@@ -7,7 +7,7 @@ import util.Spans._, Types._, Contexts._, Constants._, Names._, NameOps._, Flags
 import Symbols._, StdNames._, Trees._, Phases._, ContextOps._
 import Decorators._, transform.SymUtils._
 import NameKinds.{UniqueName, EvidenceParamName, DefaultGetterName}
-import typer.{FrontEnd, Namer, Checking}
+import typer.{TyperPhase, Namer, Checking}
 import util.{Property, SourceFile, SourcePosition}
 import config.Feature.{sourceVersion, migrateTo3, enabled}
 import config.SourceVersion._
@@ -520,7 +520,11 @@ object desugar {
           enumCases.last.pushAttachment(DesugarEnums.DefinesEnumLookupMethods, ())
         val enumCompanionRef = TermRefTree()
         val enumImport =
-          Import(enumCompanionRef, enumCases.flatMap(caseIds).map(ImportSelector(_)))
+          Import(enumCompanionRef, enumCases.flatMap(caseIds).map(
+            enumCase => 
+              ImportSelector(enumCase.withSpan(enumCase.span.startPos))
+            ) 
+          )
         (enumImport :: enumStats, enumCases, enumCompanionRef)
       }
       else (stats, Nil, EmptyTree)
@@ -693,23 +697,11 @@ object desugar {
     // For all other classes, the parent is AnyRef.
     val companions =
       if (isCaseClass) {
-
-        // true if access to the apply method has to be restricted
-        // i.e. if the case class constructor is either private or qualified private
-        def restrictedAccess = {
-          val mods = constr1.mods
-          mods.is(Private) || (!mods.is(Protected) && mods.hasPrivateWithin)
-        }
-
         val applyMeths =
           if (mods.is(Abstract)) Nil
           else {
-            val copiedFlagsMask = copiedAccessFlags & Private
-            val appMods = {
-              val mods = Modifiers(Synthetic | constr1.mods.flags & copiedFlagsMask)
-              if (restrictedAccess) mods.withPrivateWithin(constr1.mods.privateWithin)
-              else mods
-            }
+            val appMods =
+              Modifiers(Synthetic | constr1.mods.flags & copiedAccessFlags).withPrivateWithin(constr1.mods.privateWithin)
             val appParamss =
               derivedVparamss.nestedZipWithConserve(constrVparamss)((ap, cp) =>
                 ap.withMods(ap.mods | (cp.mods.flags & HasDefault)))
@@ -783,7 +775,7 @@ object desugar {
         DefDef(
           className.toTermName, joinParams(constrTparams, defParamss),
           classTypeRef, creatorExpr)
-          .withMods(companionMods | mods.flags.toTermFlags & GivenOrImplicit | Synthetic | Final)
+          .withMods(companionMods | mods.flags.toTermFlags & (GivenOrImplicit | Inline) | Final)
           .withSpan(cdef.span) :: Nil
       }
 
@@ -809,7 +801,9 @@ object desugar {
             Nil
         }
       }
-      val classMods = if mods.is(Given) then mods &~ Given | Synthetic else mods
+      if mods.isAllOf(Given | Inline | Transparent) then
+        report.error("inline given instances cannot be trasparent", cdef)
+      val classMods = if mods.is(Given) then mods &~ (Inline | Transparent) | Synthetic else mods
       cpy.TypeDef(cdef: TypeDef)(
         name = className,
         rhs = cpy.Template(impl)(constr, parents1, clsDerived, self1,
@@ -1137,10 +1131,11 @@ object desugar {
           ) // no `_`
 
       val ids = for ((named, _) <- vars) yield Ident(named.name)
-      val caseDef = CaseDef(pat, EmptyTree, makeTuple(ids))
       val matchExpr =
         if (tupleOptimizable) rhs
-        else Match(makeSelector(rhs, MatchCheck.IrrefutablePatDef), caseDef :: Nil)
+        else
+          val caseDef = CaseDef(pat, EmptyTree, makeTuple(ids)) 
+          Match(makeSelector(rhs, MatchCheck.IrrefutablePatDef), caseDef :: Nil)
       vars match {
         case Nil if !mods.is(Lazy) =>
           matchExpr
@@ -1152,7 +1147,7 @@ object desugar {
             mods & Lazy | Synthetic | (if (ctx.owner.isClass) PrivateLocal else EmptyFlags)
           val firstDef =
             ValDef(tmpName, TypeTree(), matchExpr)
-              .withSpan(pat.span.union(rhs.span)).withMods(patMods)
+              .withSpan(pat.span.startPos).withMods(patMods)
           val useSelectors = vars.length <= 22
           def selector(n: Int) =
             if useSelectors then Select(Ident(tmpName), nme.selectorName(n))
@@ -1160,8 +1155,16 @@ object desugar {
           val restDefs =
             for (((named, tpt), n) <- vars.zipWithIndex if named.name != nme.WILDCARD)
             yield
-              if (mods.is(Lazy)) derivedDefDef(original, named, tpt, selector(n), mods &~ Lazy)
-              else derivedValDef(original, named, tpt, selector(n), mods)
+              if mods.is(Lazy) then 
+                DefDef(named.name.asTermName, Nil, tpt, selector(n))
+                  .withMods(mods &~ Lazy)
+                  .withSpan(named.span)
+              else 
+                valDef(
+                  ValDef(named.name.asTermName, tpt, selector(n))
+                    .withMods(mods)
+                    .withSpan(named.span)
+                )
           flatTree(firstDef :: restDefs)
       }
   }
@@ -1260,6 +1263,18 @@ object desugar {
     else
       makeOp(left, right, Span(left.span.start, op.span.end, op.span.start))
   }
+
+  /** Translate throws type `A throws E1 | ... | En` to
+   *  $throws[... $throws[A, E1] ... , En].
+   */
+  def throws(tpt: Tree, op: Ident, excepts: Tree)(using Context): AppliedTypeTree = excepts match
+    case Parens(excepts1) =>
+      throws(tpt, op, excepts1)
+    case InfixOp(l, bar @ Ident(tpnme.raw.BAR), r) =>
+      throws(throws(tpt, op, l), bar, r)
+    case e =>
+      AppliedTypeTree(
+        TypeTree(defn.throwsAlias.typeRef).withSpan(op.span), tpt :: excepts :: Nil)
 
   /** Translate tuple expressions of arity <= 22
    *
@@ -1398,29 +1413,6 @@ object desugar {
     val mods = if (isErased) Given | Erased else Given
     val params = makeImplicitParameters(formals, mods)
     FunctionWithMods(params, body, Modifiers(mods))
-  }
-
-  /** Add annotation to tree:
-   *      tree @fullName
-   *
-   *  The annotation is usually represented as a TypeTree referring to the class
-   *  with the given name `fullName`. However, if the annotation matches a file name
-   *  that is still to be entered, the annotation is represented as a cascade of `Selects`
-   *  following `fullName`. This is necessary so that we avoid reading an annotation from
-   *  the classpath that is also compiled from source.
-   */
-  def makeAnnotated(fullName: String, tree: Tree)(using Context): Annotated = {
-    val parts = fullName.split('.')
-    val ttree = typerPhase match {
-      case phase: FrontEnd if phase.stillToBeEntered(parts.last) =>
-        val prefix =
-          parts.init.foldLeft(Ident(nme.ROOTPKG): Tree)((qual, name) =>
-            Select(qual, name.toTermName))
-        Select(prefix, parts.last.toTypeName)
-      case _ =>
-        TypeTree(requiredClass(fullName).typeRef)
-    }
-    Annotated(tree, New(ttree, Nil))
   }
 
   private def derivedValDef(original: Tree, named: NameTree, tpt: Tree, rhs: Tree, mods: Modifiers)(using Context) = {

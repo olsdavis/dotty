@@ -83,7 +83,10 @@ trait Deriving {
      */
     private def processDerivedInstance(derived: untpd.Tree): Unit = {
       val originalTypeClassType = typedAheadType(derived, AnyTypeConstructorProto).tpe
-      val typeClassType = checkClassType(underlyingClassRef(originalTypeClassType), derived.srcPos, traitReq = false, stablePrefixReq = true)
+      val underlyingClassType = underlyingClassRef(originalTypeClassType)
+      val typeClassType = checkClassType(
+          underlyingClassType.orElse(originalTypeClassType),
+          derived.srcPos, traitReq = false, stablePrefixReq = true)
       val typeClass = typeClassType.classSymbol
       val typeClassParams = typeClass.typeParams
       val typeClassArity = typeClassParams.length
@@ -160,7 +163,7 @@ trait Deriving {
         val clsParamInfos = clsType.typeParams
         val clsArity = clsParamInfos.length
         val alignedClsParamInfos = clsParamInfos.takeRight(instanceArity)
-        val alignedTypeClassParamInfos = typeClassParamInfos.take(alignedClsParamInfos.length)
+        val alignedTypeClassParamInfos = typeClassParamInfos.takeRight(alignedClsParamInfos.length)
 
 
         if ((instanceArity == clsArity || instanceArity > 0) && sameParamKinds(alignedClsParamInfos, alignedTypeClassParamInfos)) {

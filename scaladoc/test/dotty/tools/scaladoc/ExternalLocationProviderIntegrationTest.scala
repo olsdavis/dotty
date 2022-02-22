@@ -25,23 +25,45 @@ class JavadocExternalLocationProviderIntegrationTest extends ExternalLocationPro
 
 class Scaladoc2ExternalLocationProviderIntegrationTest extends ExternalLocationProviderIntegrationTest(
   "externalScaladoc2",
-  List(".*scala.*::scaladoc2::https://www.scala-lang.org/api/current/"),
+  List(
+    ".*scala/.*::scaladoc2::https://www.scala-lang.org/api/current/",
+    ".*externalStubs.*::scaladoc2::https://external.stubs/api/"
+  ),
+  List(
+    "https://www.scala-lang.org/api/current/scala/util/matching/Regex$$Match.html",
+    "https://www.scala-lang.org/api/current/scala/Predef$.html#String",
+    "https://www.scala-lang.org/api/current/scala/collection/immutable/Map.html",
+    "https://www.scala-lang.org/api/current/scala/collection/IterableOnceOps.html#addString(b:StringBuilder,start:String,sep:String,end:String):StringBuilder",
+    "https://www.scala-lang.org/api/current/scala/collection/IterableOnceOps.html#mkString(start:String,sep:String,end:String):String",
+    "https://external.stubs/api/tests/externalStubs/$div$bslash$.html",
+    "https://external.stubs/api/tests/externalStubs/$bslash$div$.html"
+  )
+)
+
+class Scaladoc3ExternalLocationProviderIntegrationTest extends ExternalLocationProviderIntegrationTest(
+  "externalScaladoc3",
+  List(
+    ".*scala/.*::scaladoc3::https://dotty.epfl.ch/api/",
+    ".*externalStubs.*::scaladoc3::https://external.stubs/api/"
+  ),
+  List(
+    "https://dotty.epfl.ch/api/scala/collection/immutable/Map.html",
+    "https://dotty.epfl.ch/api/scala/Predef$.html#String-0",
+    "https://dotty.epfl.ch/api/scala/util/matching/Regex$$Match.html",
+    "https://external.stubs/api/tests/externalStubs/$div$bslash$.html",
+    "https://external.stubs/api/tests/externalStubs/$bslash$div$.html"
+  )
+)
+
+class Scaladoc2LegacyExternalLocationProviderIntegrationTest extends LegacyExternalLocationProviderIntegrationTest(
+  "externalScaladoc2",
+  List(".*scala.*#https://www.scala-lang.org/api/current/"),
   List(
     "https://www.scala-lang.org/api/current/scala/util/matching/Regex$$Match.html",
     "https://www.scala-lang.org/api/current/scala/Predef$.html#String",
     "https://www.scala-lang.org/api/current/scala/collection/immutable/Map.html",
     "https://www.scala-lang.org/api/current/scala/collection/IterableOnceOps.html#addString(b:StringBuilder,start:String,sep:String,end:String):StringBuilder",
     "https://www.scala-lang.org/api/current/scala/collection/IterableOnceOps.html#mkString(start:String,sep:String,end:String):String"
-  )
-)
-
-class Scaladoc3ExternalLocationProviderIntegrationTest extends ExternalLocationProviderIntegrationTest(
-  "externalScaladoc3",
-  List(".*scala.*::scaladoc3::https://dotty.epfl.ch/api/"),
-  List(
-    "https://dotty.epfl.ch/api/scala/collection/immutable/Map.html",
-    "https://dotty.epfl.ch/api/scala/Predef$.html#String-0",
-    "https://dotty.epfl.ch/api/scala/util/matching/Regex$$Match.html"
   )
 )
 
@@ -60,7 +82,7 @@ abstract class ExternalLocationProviderIntegrationTest(
   )
 
   override def runTest = afterRendering {
-    val output = summon[DocContext].args.output.toPath.resolve("api")
+    val output = summon[DocContext].args.output.toPath
     val linksBuilder = List.newBuilder[String]
 
     def processFile(path: Path): Unit =
@@ -72,7 +94,6 @@ abstract class ExternalLocationProviderIntegrationTest(
         linksBuilder ++= hrefValues
       }
 
-    println(output)
     IO.foreachFileIn(output, processFile)
     val links = linksBuilder.result
     val errors = expectedLinks.flatMap(expect => Option.when(!links.contains(expect))(expect))
@@ -85,4 +106,17 @@ abstract class ExternalLocationProviderIntegrationTest(
       reportError(reportMessage)
     }
   } :: Nil
+
+abstract class LegacyExternalLocationProviderIntegrationTest(
+  name: String,
+  mappings: Seq[String],
+  expectedLinks: Seq[String]
+) extends ExternalLocationProviderIntegrationTest(name, mappings, expectedLinks):
+
+  override def args = super.args.copy(
+      externalMappings = mappings.flatMap( s =>
+        ExternalDocLink.parseLegacy(s).fold(left => None, right => Some(right)
+      )
+    ).toList
+  )
 

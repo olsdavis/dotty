@@ -12,7 +12,6 @@ import dotty.tools.dotc.core.NameKinds._
 import dotty.tools.dotc.core.StagingContext._
 import dotty.tools.dotc.core.StdNames._
 import dotty.tools.dotc.core.Symbols._
-import dotty.tools.dotc.core.tasty.TreePickler.Hole
 import dotty.tools.dotc.core.Types._
 import dotty.tools.dotc.quoted._
 import dotty.tools.dotc.util.{SourceFile, SrcPos}
@@ -34,6 +33,8 @@ class Staging extends MacroTransform {
   import Staging._
 
   override def phaseName: String = Staging.name
+
+  override def description: String = Staging.description
 
   override def runsAfter: Set[String] = Set(Inlining.name)
 
@@ -86,4 +87,5 @@ class Staging extends MacroTransform {
 
 object Staging {
   val name: String = "staging"
+  val description: String = "check staging levels and heal staged types"
 }

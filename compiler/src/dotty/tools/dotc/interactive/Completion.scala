@@ -24,6 +24,7 @@ import dotty.tools.dotc.printing.Texts._
 import dotty.tools.dotc.util.{NameTransformer, NoSourcePosition, SourcePosition}
 
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 /**
  * One of the results of a completion query.
@@ -61,6 +62,8 @@ object Completion {
    */
   def completionMode(path: List[Tree], pos: SourcePosition): Mode =
     path match {
+      case Ident(_) :: Import(_, _) :: _ =>
+        Mode.Import
       case (ref: RefTree) :: _ =>
         if (ref.name.isTermName) Mode.Term
         else if (ref.name.isTypeName) Mode.Type
@@ -112,10 +115,14 @@ object Completion {
     val completer = new Completer(mode, prefix, pos)
 
     val completions = path match {
-        case Select(qual, _) :: _                              => completer.selectionCompletions(qual)
-        case Import(expr, _) :: _                              => completer.directMemberCompletions(expr)
-        case (_: untpd.ImportSelector) :: Import(expr, _) :: _ => completer.directMemberCompletions(expr)
-        case _                                                 => completer.scopeCompletions
+        // Ignore synthetic select from `This` because in code it was `Ident`
+        // See example in dotty.tools.languageserver.CompletionTest.syntheticThis
+        case Select(qual @ This(_), _) :: _ if qual.span.isSynthetic  => completer.scopeCompletions
+        case Select(qual, _) :: _           if qual.tpe.hasSimpleKind => completer.selectionCompletions(qual)
+        case Select(qual, _) :: _                                     => Map.empty
+        case Import(expr, _) :: _                                     => completer.directMemberCompletions(expr)
+        case (_: untpd.ImportSelector) :: Import(expr, _) :: _        => completer.directMemberCompletions(expr)
+        case _                                                        => completer.scopeCompletions
       }
 
     val describedCompletions = describeCompletions(completions)
@@ -197,14 +204,45 @@ object Completion {
 
       mappings.foreach { (name, denotss) =>
         val first = denotss.head
+
+        // import a.c
+        def isSingleImport =  denotss.length < 2
+        // import a.C
+        // locally {  import b.C }
+        def isImportedInDifferentScope =  first.ctx.scope ne denotss(1).ctx.scope
+        // import a.C
+        // import a.C
+        def isSameSymbolImportedDouble =  denotss.forall(_.denots == first.denots)
+
+        def isScalaPackage(scopedDenots: ScopedDenotations) =
+          scopedDenots.denots.exists(_.info.typeSymbol.owner == defn.ScalaPackageClass)
+
+        def isJavaLangPackage(scopedDenots: ScopedDenotations) =
+          scopedDenots.denots.exists(_.info.typeSymbol.owner == defn.JavaLangPackageClass)
+
+        // For example
+        // import java.lang.annotation
+        //    is shadowed by
+        // import scala.annotation
+        def isJavaLangAndScala =
+          try
+            denotss.forall(denots => isScalaPackage(denots) || isJavaLangPackage(denots))
+          catch
+            case NonFatal(_) => false
+
         denotss.find(!_.ctx.isImportContext) match {
           // most deeply nested member or local definition if not shadowed by an import
           case Some(local) if local.ctx.scope == first.ctx.scope =>
             resultMappings += name -> local.denots
 
-          // most deeply nested import if not shadowed by another import
-          case None if denotss.length < 2 || (denotss(1).ctx.scope ne first.ctx.scope) =>
+          case None if isSingleImport || isImportedInDifferentScope || isSameSymbolImportedDouble =>
             resultMappings += name -> first.denots
+          case None if isJavaLangAndScala =>
+            denotss.foreach{
+              denots =>
+                if isScalaPackage(denots) then
+                  resultMappings += name -> denots.denots
+            }
 
           case _ =>
         }
@@ -300,7 +338,8 @@ object Completion {
               case name: TermName if include(denot, name) => Some((denot, name))
               case _ => None
 
-        types.flatMap { tpe =>
+        types.flatMap { tp =>
+          val tpe = tp.widenExpr
           tpe.membersBasedOnFlags(required = ExtensionMethod, excluded = EmptyFlags)
             .collect { case DenotWithMatchingName(denot, name) => TermRef(tpe, denot.symbol) -> name }
         }
@@ -322,7 +361,7 @@ object Completion {
       val extMethodsFromImplicitScope = extractMemberExtensionMethods(implicitScopeCompanions)
 
       // 4. The reference is of the form r.m and the extension method is defined in some given instance in the implicit scope of the type of r.
-      val givensInImplicitScope = implicitScopeCompanions.flatMap(_.membersBasedOnFlags(required = Given, excluded = EmptyFlags)).map(_.info)
+      val givensInImplicitScope = implicitScopeCompanions.flatMap(_.membersBasedOnFlags(required = GivenVal, excluded = EmptyFlags)).map(_.info)
       val extMethodsFromGivensInImplicitScope = extractMemberExtensionMethods(givensInImplicitScope)
 
       val availableExtMethods = extMethodsFromGivensInImplicitScope ++ extMethodsFromImplicitScope ++ extMethodsFromGivensInScope ++ extMethodsInScope

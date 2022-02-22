@@ -113,11 +113,11 @@ trait TreeInfo[T >: Untyped <: Type] { self: Trees.Instance[T] =>
     case _ => 0
   }
 
-  /** The (last) list of arguments of an application */
-  def arguments(tree: Tree): List[Tree] = unsplice(tree) match {
-    case Apply(_, args) => args
-    case TypeApply(fn, _) => arguments(fn)
-    case Block(_, expr) => arguments(expr)
+  /** All term arguments of an application in a single flattened list */
+  def allArguments(tree: Tree): List[Tree] = unsplice(tree) match {
+    case Apply(fn, args) => allArguments(fn) ::: args
+    case TypeApply(fn, _) => allArguments(fn)
+    case Block(_, expr) => allArguments(expr)
     case _ => Nil
   }
 
@@ -569,6 +569,7 @@ trait TypedTreeInfo extends TreeInfo[Type] { self: Trees.Instance[Type] =>
    *  This avoids the situation where we have a Select node that does not have a symbol.
    */
   def constToLiteral(tree: Tree)(using Context): Tree = {
+    assert(!tree.isType)
     val tree1 = ConstFold(tree)
     tree1.tpe.widenTermRefExpr.dealias.normalized match {
       case ConstantType(Constant(_: Type)) if tree.isInstanceOf[Block] =>

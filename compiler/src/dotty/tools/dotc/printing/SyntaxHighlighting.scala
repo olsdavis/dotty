@@ -17,7 +17,7 @@ import java.util.Arrays
 object SyntaxHighlighting {
 
   /** if true, log erroneous positions being highlighted */
-  private final val debug = true
+  private inline val debug = true
 
   // Keep in sync with SyntaxHighlightingTests
   val NoColor: String         = Console.RESET
@@ -112,7 +112,7 @@ object SyntaxHighlighting {
               highlightPosition(tree.nameSpan, TypeColor)
             case tree: Ident if tree.isType =>
               highlightPosition(tree.span, TypeColor)
-            case _: TypTree =>
+            case _: TypeTree =>
               highlightPosition(tree.span, TypeColor)
             case _ =>
           }

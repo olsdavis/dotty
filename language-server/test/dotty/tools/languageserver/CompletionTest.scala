@@ -404,6 +404,19 @@ class CompletionTest {
       .completion(m1, Set())
   }
 
+  @Test def completeFromSameImportsForEqualNestingLevels: Unit = {
+    code"""object Foo {
+          |  def xxxx(i: Int): Int = i
+          |}
+          |object Test {
+          |  import Foo.xxxx
+          |  import Foo.xxxx
+          |  import Foo.xxxx
+          |  val x = xx$m1
+          |}""".withSource
+      .completion(m1, Set(("xxxx", Method, "(i: Int): Int")))
+  }
+
   @Test def preferLocalDefinitionToImportForEqualNestingLevels: Unit = {
     code"""object Foo {
           |  val xxxx = 1
@@ -547,7 +560,8 @@ class CompletionTest {
   }
 
   @Test def completeFromPackageObjectWithInheritance: Unit = {
-    code"""trait Foo[A] { def xxxx(a: A) = a }
+    code"""package test
+          |trait Foo[A] { def xxxx(a: A) = a }
           |package object foo extends Foo[Int] {}
           |object Test {
           |  foo.xx$m1
@@ -841,5 +855,172 @@ class CompletionTest {
     code"""extension (i: Int) def xxxx = i
           |object Main { "abc".xx${m1} }""".withSource
       .completion(m1, Set())
+  }
+
+  @Test def i13365: Unit = {
+    code"""|import scala.quoted._
+        |
+        |object Test {
+        |  def test(using Quotes)(str: String) = {
+        |    import quotes.reflect._
+        |    val msg = Expr(str)
+        |    val printHello = '{ print("sdsd") }
+        |    val tree = printHello.asTerm
+        |    tree.sh${m1}
+        |  }
+        |}""".withSource
+      .completion(m1, Set(("show",Method, "(using x$2: x$1.reflect.Printer[x$1.reflect.Tree]): String")))
+  }
+
+  @Test def syntheticThis: Unit = {
+    code"""|class Y() {
+           |  def bar: Unit =
+           |    val argument: Int = ???
+           |    arg${m1}
+           |
+           |  def arg: String = ???
+           |}
+           |""".withSource
+      .completion(m1, Set(("arg", Method, "=> String"),
+                          ("argument", Field, "Int")))
+  }
+
+  @Test def concatMethodWithImplicits: Unit = {
+    code"""|object A {
+           |  Array.concat${m1}
+           |}""".withSource
+      .completion(
+          m1,
+          Set(
+            (
+              "concat",
+              Method,
+              "[T](xss: Array[T]*)(implicit evidence$11: scala.reflect.ClassTag[T]): Array[T]"
+            )
+          )
+        )
+  }
+
+  @Test def i12465_hkt: Unit =
+    code"""???.asInstanceOf[scala.collection.Seq].${m1}""".withSource
+      .completion(m1, Set())
+
+  @Test def i12465_hkt_alias: Unit =
+    code"""???.asInstanceOf[Seq].${m1}""".withSource
+      .completion(m1, Set())
+
+  @Test def i13624_annotType: Unit =
+    code"""|object Foo{
+           |  class MyAnnotation extends annotation.StaticAnnotation
+           |}
+           |class MyAnnotation extends annotation.StaticAnnotation
+           |class Annotation2(a: String) extends annotation.StaticAnnotation
+           |val x = 1: @MyAnnot${m1}
+           |type X = Int @MyAnnot${m2}
+           |val y = 1: @Foo.MyAnnot${m3}
+           |val z = 1: @Foo.MyAnnotation @MyAnno${m4}
+           |type Y = Int @MyAnnotation @Foo.MyAnnota${m5}
+           |val w = 1: @Annotation2("abc": @Foo.MyAnnot${m6})
+           |""".withSource
+      .completion(
+        m1,
+        Set(
+          ("MyAnnotation", Class, "MyAnnotation"),
+          ("MyAnnotation", Module, "MyAnnotation")
+        )
+      ).completion(
+        m2,
+        Set(
+          ("MyAnnotation", Class, "MyAnnotation"),
+          ("MyAnnotation", Module, "MyAnnotation")
+        )
+      ).completion(
+        m3,
+        Set(
+          ("MyAnnotation", Class, "Foo.MyAnnotation"),
+          ("MyAnnotation", Module, "Foo.MyAnnotation")
+        )
+      ).completion(
+        m4,
+        Set(
+          ("MyAnnotation", Class, "MyAnnotation"),
+          ("MyAnnotation", Module, "MyAnnotation")
+        )
+      ).completion(
+        m5,
+        Set(
+          ("MyAnnotation", Class, "Foo.MyAnnotation"),
+          ("MyAnnotation", Module, "Foo.MyAnnotation")
+        )
+      ).completion(
+        m6,
+        Set(
+          ("MyAnnotation", Class, "Foo.MyAnnotation"),
+          ("MyAnnotation", Module, "Foo.MyAnnotation")
+        )
+      )
+
+  @Test def i13624_annotation : Unit =
+    code"""@annotation.implicitNot${m1}
+          |@annotation.implicitNotFound @mai${m2}"""
+          .withSource
+          .completion(m1,
+            Set(
+              ("implicitNotFound", Class, "scala.annotation.implicitNotFound"),
+              ("implicitNotFound", Module, "scala.annotation.implicitNotFound")
+            )
+          )
+          .completion(m2,
+            Set(
+              ("main", Class, "scala.main"),
+              ("main", Module, "main")
+            )
+          )
+
+  @Test def i13623_annotation : Unit =
+    code"""import annot${m1}"""
+          .withSource
+          .completion(m1,
+            Set(
+              ("annotation", Module, "scala.annotation")
+            )
+          )
+
+  @Test def importAnnotationAfterImport : Unit =
+    code"""import java.lang.annotation; import annot${m1}"""
+        .withSource
+        .completion(m1,
+          Set(
+            ("annotation", Module, "scala.annotation")
+          )
+        )
+  @Test def completeTemplateConstrArgType: Unit = {
+    val expected = Set(
+      ("Future", Class, "scala.concurrent.Future"),
+      ("Future", Module, "scala.concurrent.Future")
+    )
+    code"""import scala.concurrent.Future
+          |class Foo(x: Fut${m1})""".withSource
+      .completion(m1, expected) 
+  }
+
+  @Test def completeTemplateParents: Unit = {
+    val expected = Set(
+      ("Future", Class, "scala.concurrent.Future"),
+      ("Future", Module, "scala.concurrent.Future")
+    )
+    code"""import scala.concurrent.Future
+          |class Foo extends Futu${m1}""".withSource
+      .completion(m1, expected) 
+  }
+
+  @Test def completeTemplateSelfType: Unit = {
+    val expected = Set(
+      ("Future", Class, "scala.concurrent.Future"),
+      ("Future", Module, "scala.concurrent.Future")
+    )
+    code"""import scala.concurrent.Future
+          |class Foo[A]{ self: Futu${m1} => }""".withSource
+      .completion(m1, expected) 
   }
 }

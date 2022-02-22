@@ -32,6 +32,22 @@ class TestBCode extends DottyBytecodeTest {
     }
   }
 
+  @Test def byNameParameters = {
+    val source = """
+                   |class Foo {
+                   |  def byNameParam(str: => String): Unit = {}
+                   |}
+                 """.stripMargin
+
+    checkBCode(source) { dir =>
+      val clsIn      = dir.lookupName("Foo.class", directory = false).input
+      val clsNode    = loadClassNode(clsIn)
+      val methodNode: MethodNode = getMethod(clsNode, "byNameParam")
+
+      assert(methodNode.signature == "(Lscala/Function0<Ljava/lang/String;>;)V")
+    }
+  }
+
   /** This test verifies that simple matches are transformed if possible
    *  despite no annotation
    */
@@ -106,6 +122,28 @@ class TestBCode extends DottyBytecodeTest {
         |    case 1 if b => println(2)
         |    case 1 => println(1)
         |    case 0 => println(0)
+        |  }
+        |}
+      """.stripMargin
+
+    checkBCode(source) { dir =>
+      val moduleIn   = dir.lookupName("Foo$.class", directory = false)
+      val moduleNode = loadClassNode(moduleIn.input)
+      val methodNode = getMethod(moduleNode, "foo")
+      assert(verifySwitch(methodNode))
+    }
+  }
+
+  @Test def switchOnStrings = {
+    val source =
+      """
+        |object Foo {
+        |  import scala.annotation.switch
+        |  def foo(s: String) = s match {
+        |    case "AaAa" => println(3)
+        |    case "BBBB" | "c" => println(2)
+        |    case "D" | "E" => println(1)
+        |    case _ => println(0)
         |  }
         |}
       """.stripMargin
@@ -677,7 +715,7 @@ class TestBCode extends DottyBytecodeTest {
       """.stripMargin)
 
   @Test def objectsInObjDefAreFinal =
-    checkFinalClass("Test$Foo$1$.class",
+    checkFinalClass("Test$Foo$2$.class",
       """
         |object Test {
         |  def bar() = {
@@ -687,7 +725,7 @@ class TestBCode extends DottyBytecodeTest {
       """.stripMargin)
 
   @Test def objectsInClassDefAreFinal =
-    checkFinalClass("Test$Foo$1$.class",
+    checkFinalClass("Test$Foo$2$.class",
       """
         |class Test {
         |  def bar() = {
@@ -697,7 +735,7 @@ class TestBCode extends DottyBytecodeTest {
       """.stripMargin)
 
   @Test def objectsInObjValAreFinal =
-    checkFinalClass("Test$Foo$1$.class",
+    checkFinalClass("Test$Foo$2$.class",
       """
         |class Test {
         |  val bar = {
@@ -759,17 +797,14 @@ class TestBCode extends DottyBytecodeTest {
         FrameEntry(1, List(1), List()),
         VarOp(Opcodes.ILOAD, 1),
         Op(Opcodes.ICONST_5),
-        Jump(Opcodes.IF_ICMPGT, Label(16)),
+        Jump(Opcodes.IF_ICMPGT, Label(13)),
         Field(Opcodes.GETSTATIC, "scala/Predef$", "MODULE$", "Lscala/Predef$;"),
         VarOp(Opcodes.ILOAD, 1),
         Invoke(Opcodes.INVOKESTATIC, "scala/runtime/BoxesRunTime", "boxToInteger", "(I)Ljava/lang/Integer;", false),
         Invoke(Opcodes.INVOKEVIRTUAL, "scala/Predef$", "println", "(Ljava/lang/Object;)V", false),
-        VarOp(Opcodes.ILOAD, 1),
-        Op(Opcodes.ICONST_1),
-        Op(Opcodes.IADD),
-        VarOp(Opcodes.ISTORE, 1),
+        Incr(Opcodes.IINC, 1, 1),
         Jump(Opcodes.GOTO, Label(2)),
-        Label(16),
+        Label(13),
         FrameEntry(3, List(), List()),
         Op(Opcodes.RETURN))
 
@@ -938,7 +973,7 @@ class TestBCode extends DottyBytecodeTest {
 
   @Test
   def invocationReceivers(): Unit = {
-    import Opcodes._
+    import Opcodes.*
 
     checkBCode(List(invocationReceiversTestCode.definitions("Object"))) { dir =>
       val c1 = loadClassNode(dir.lookupName("C1.class", directory = false).input)

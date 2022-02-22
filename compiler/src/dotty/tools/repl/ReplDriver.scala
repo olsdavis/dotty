@@ -5,7 +5,10 @@ import java.nio.charset.StandardCharsets
 
 import dotty.tools.dotc.ast.Trees._
 import dotty.tools.dotc.ast.{tpd, untpd}
+import dotty.tools.dotc.config.CommandLineParser.tokenize
+import dotty.tools.dotc.config.Properties.{javaVersion, javaVmName, simpleVersionString}
 import dotty.tools.dotc.core.Contexts._
+import dotty.tools.dotc.core.Decorators._
 import dotty.tools.dotc.core.Phases.{unfusedPhases, typerPhase}
 import dotty.tools.dotc.core.Denotations.Denotation
 import dotty.tools.dotc.core.Flags._
@@ -16,15 +19,17 @@ import dotty.tools.dotc.core.NameOps._
 import dotty.tools.dotc.core.Names.Name
 import dotty.tools.dotc.core.StdNames._
 import dotty.tools.dotc.core.Symbols.{Symbol, defn}
+import dotty.tools.dotc.interfaces
 import dotty.tools.dotc.interactive.Completion
 import dotty.tools.dotc.printing.SyntaxHighlighting
-import dotty.tools.dotc.reporting.MessageRendering
+import dotty.tools.dotc.reporting.{ConsoleReporter, MessageRendering, StoreReporter}
 import dotty.tools.dotc.reporting.{Message, Diagnostic}
 import dotty.tools.dotc.util.Spans.Span
 import dotty.tools.dotc.util.{SourceFile, SourcePosition}
 import dotty.tools.dotc.{CompilationUnit, Driver}
 import dotty.tools.dotc.config.CompilerCommand
 import dotty.tools.io._
+import dotty.tools.runner.ScalaClassLoader.*
 import org.jline.reader._
 
 import scala.annotation.tailrec
@@ -58,7 +63,7 @@ case class State(objectIndex: Int,
 /** Main REPL instance, orchestrating input, compilation and presentation */
 class ReplDriver(settings: Array[String],
                  out: PrintStream = Console.out,
-                 classLoader: Option[ClassLoader] = None) extends Driver {
+                 classLoader: Option[ClassLoader] = None) extends Driver:
 
   /** Overridden to `false` in order to not have to give sources on the
    *  commandline
@@ -66,15 +71,21 @@ class ReplDriver(settings: Array[String],
   override def sourcesRequired: Boolean = false
 
   /** Create a fresh and initialized context with IDE mode enabled */
-  private def initialCtx = {
+  private def initialCtx(settings: List[String]) = {
     val rootCtx = initCtx.fresh.addMode(Mode.ReadPositions | Mode.Interactive)
     rootCtx.setSetting(rootCtx.settings.YcookComments, true)
     rootCtx.setSetting(rootCtx.settings.YreadComments, true)
+    setupRootCtx(this.settings ++ settings, rootCtx)
+  }
+
+  private def setupRootCtx(settings: Array[String], rootCtx: Context) = {
     setup(settings, rootCtx) match
-      case Some((files, ictx)) =>
+      case Some((files, ictx)) => inContext(ictx) {
         shouldStart = true
-        ictx.base.initialize()(using ictx)
+        if files.nonEmpty then out.println(i"Ignoring spurious arguments: $files%, %")
+        ictx.base.initialize()
         ictx
+      }
       case None =>
         shouldStart = false
         rootCtx
@@ -89,8 +100,8 @@ class ReplDriver(settings: Array[String],
    *  such, when the user enters `:reset` this method should be called to reset
    *  everything properly
    */
-  protected def resetToInitial(): Unit = {
-    rootCtx = initialCtx
+  protected def resetToInitial(settings: List[String] = Nil): Unit = {
+    rootCtx = initialCtx(settings)
     if (rootCtx.settings.outputDir.isDefault(using rootCtx))
       rootCtx = rootCtx.fresh
         .setSetting(rootCtx.settings.outputDir, new VirtualDirectory("<REPL compilation output>"))
@@ -124,6 +135,10 @@ class ReplDriver(settings: Array[String],
   final def runUntilQuit(initialState: State = initialState): State = {
     val terminal = new JLineTerminal
 
+    out.println(
+      s"""Welcome to Scala $simpleVersionString ($javaVersion, Java $javaVmName).
+         |Type in expressions for evaluation. Or try :help.""".stripMargin)
+
     /** Blockingly read a line, getting back a parse result */
     def readLine(state: State): ParseResult = {
       val completer: Completer = { (_, line, candidates) =>
@@ -147,14 +162,16 @@ class ReplDriver(settings: Array[String],
       else loop(interpret(res)(state))
     }
 
-    try withRedirectedOutput { loop(initialState) }
+    try runBody { loop(initialState) }
     finally terminal.close()
   }
 
-  final def run(input: String)(implicit state: State): State = withRedirectedOutput {
+  final def run(input: String)(implicit state: State): State = runBody {
     val parsed = ParseResult(input)(state)
     interpret(parsed)
   }
+
+  private def runBody(body: => State): State = rendering.classLoader()(using rootCtx).asContext(withRedirectedOutput(body))
 
   // TODO: i5069
   final def bind(name: String, value: Any)(implicit state: State): State = state
@@ -174,8 +191,8 @@ class ReplDriver(settings: Array[String],
     }
   }
 
-  private def newRun(state: State) = {
-    val run = compiler.newRun(rootCtx.fresh.setReporter(newStoreReporter), state)
+  private def newRun(state: State, reporter: StoreReporter = newStoreReporter) = {
+    val run = compiler.newRun(rootCtx.fresh.setReporter(reporter), state)
     state.copy(context = run.runContext)
   }
 
@@ -208,7 +225,7 @@ class ReplDriver(settings: Array[String],
   }
 
   private def interpret(res: ParseResult)(implicit state: State): State = {
-    val newState = res match {
+    res match {
       case parsed: Parsed if parsed.trees.nonEmpty =>
         compile(parsed, state)
 
@@ -225,11 +242,6 @@ class ReplDriver(settings: Array[String],
       case _ => // new line, empty tree
         state
     }
-    inContext(newState.context) {
-      if (!ctx.settings.XreplDisableDisplay.value)
-        out.println()
-      newState
-    }
   }
 
   /** Compile `parsed` trees and evolve `state` in accordance */
@@ -242,8 +254,14 @@ class ReplDriver(settings: Array[String],
     def extractTopLevelImports(ctx: Context): List[tpd.Import] =
       unfusedPhases(using ctx).collectFirst { case phase: CollectTopLevelImports => phase.imports }.get
 
+    def contextWithNewImports(ctx: Context, imports: List[tpd.Import]): Context =
+      if imports.isEmpty then ctx
+      else
+        imports.foldLeft(ctx.fresh.setNewScope)((ctx, imp) =>
+          ctx.importContext(imp, imp.symbol(using ctx)))
+
     implicit val state = {
-      val state0 = newRun(istate)
+      val state0 = newRun(istate, parsed.reporter)
       state0.copy(context = state0.context.withSource(parsed.source))
     }
     compiler
@@ -257,11 +275,13 @@ class ReplDriver(settings: Array[String],
             var allImports = newState.imports
             if (newImports.nonEmpty)
               allImports += (newState.objectIndex -> newImports)
-            val newStateWithImports = newState.copy(imports = allImports)
+            val newStateWithImports = newState.copy(
+              imports = allImports,
+              context = contextWithNewImports(newState.context, newImports)
+            )
 
             val warnings = newState.context.reporter
               .removeBufferedMessages(using newState.context)
-              .map(rendering.formatError)
 
             inContext(newState.context) {
               val (updatedState, definitions) =
@@ -278,8 +298,7 @@ class ReplDriver(settings: Array[String],
 
               (definitions ++ warnings)
                 .sorted
-                .map(_.msg)
-                .foreach(out.println)
+                .foreach(printDiagnostic)
 
               updatedState
             }
@@ -371,8 +390,8 @@ class ReplDriver(settings: Array[String],
       out.println(Help.text)
       state
 
-    case Reset =>
-      resetToInitial()
+    case Reset(arg) =>
+      resetToInitial(tokenize(arg))
       initialState
 
     case Imports =>
@@ -415,6 +434,16 @@ class ReplDriver(settings: Array[String],
       }
       state
 
+    case Settings(arg) => arg match
+      case "" =>
+        given ctx: Context = state.context
+        for (s <- ctx.settings.userSetSettings(ctx.settingsState).sortBy(_.name))
+          out.println(s"${s.name} = ${if s.value == "" then "\"\"" else s.value}")
+        state
+      case _  =>
+        rootCtx = setupRootCtx(tokenize(arg).toArray, rootCtx)
+        state.copy(context = rootCtx)
+
     case Quit =>
       // end of the world!
       state
@@ -422,7 +451,21 @@ class ReplDriver(settings: Array[String],
 
   /** shows all errors nicely formatted */
   private def displayErrors(errs: Seq[Diagnostic])(implicit state: State): State = {
-    errs.map(rendering.formatError).map(_.msg).foreach(out.println)
+    errs.foreach(printDiagnostic)
     state
   }
-}
+
+  /** Like ConsoleReporter, but without file paths, -Xprompt displaying,
+   *  and using a PrintStream rather than a PrintWriter so messages aren't re-encoded. */
+  private object ReplConsoleReporter extends ConsoleReporter.AbstractConsoleReporter {
+    override def posFileStr(pos: SourcePosition) = "" // omit file paths
+    override def printMessage(msg: String): Unit = out.println(msg)
+    override def flush()(using Context): Unit    = out.flush()
+  }
+
+  /** Print warnings & errors using ReplConsoleReporter, and info straight to out */
+  private def printDiagnostic(dia: Diagnostic)(implicit state: State) = dia.level match
+    case interfaces.Diagnostic.INFO => out.println(dia.msg) // print REPL's special info diagnostics directly to out
+    case _                          => ReplConsoleReporter.doReport(dia)(using state.context)
+
+end ReplDriver

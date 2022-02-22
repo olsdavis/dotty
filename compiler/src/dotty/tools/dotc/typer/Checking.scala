@@ -20,6 +20,7 @@ import ErrorReporting.errorTree
 import rewrites.Rewrites.patch
 import util.Spans.Span
 import Phases.refchecksPhase
+import Constants.Constant
 
 import util.SrcPos
 import util.Spans.Span
@@ -33,9 +34,12 @@ import NameKinds.DefaultGetterName
 import NameOps._
 import SymDenotations.{NoCompleter, NoDenotation}
 import Applications.unapplyArgs
+import Inferencing.isFullyDefined
 import transform.patmat.SpaceEngine.isIrrefutable
-import config.Feature._
+import config.Feature
+import config.Feature.sourceVersion
 import config.SourceVersion._
+import transform.TypeUtils.*
 
 import collection.mutable
 import reporting._
@@ -473,7 +477,7 @@ object Checking {
     if (sym.is(Implicit)) {
       if (sym.owner.is(Package))
         fail(TopLevelCantBeImplicit(sym))
-      if (sym.isType)
+      if sym.isType && (!sym.isClass || sym.is(Trait)) then
         fail(TypesAndTraitsCantBeImplicit())
     }
     if sym.is(Transparent) then
@@ -537,6 +541,9 @@ object Checking {
     checkCombination(Abstract, Override)
     checkCombination(Private, Override)
     checkCombination(Lazy, Inline)
+    // The issue with `erased inline` is that the erased semantics get lost
+    // as the code is inlined and the reference is removed before the erased usage check.
+    checkCombination(Erased, Inline)
     checkNoConflict(Lazy, ParamAccessor, s"parameter may not be `lazy`")
   }
 
@@ -719,6 +726,50 @@ object Checking {
         checkValue(tree)
       case _ =>
     tree
+
+  /** Check that experimental language imports in `trees`
+   *  are done only in experimental scopes, or in a top-level
+   *  scope with only @experimental definitions.
+   */
+  def checkExperimentalImports(trees: List[Tree])(using Context): Unit =
+
+    def nonExperimentalStat(trees: List[Tree]): Tree = trees match
+      case (_: Import | EmptyTree) :: rest =>
+        nonExperimentalStat(rest)
+      case (tree @ TypeDef(_, impl: Template)) :: rest if tree.symbol.isPackageObject =>
+        nonExperimentalStat(impl.body).orElse(nonExperimentalStat(rest))
+      case (tree: PackageDef) :: rest =>
+        nonExperimentalStat(tree.stats).orElse(nonExperimentalStat(rest))
+      case (tree: MemberDef) :: rest =>
+        if tree.symbol.isExperimental || tree.symbol.is(Synthetic) then
+          nonExperimentalStat(rest)
+        else
+          tree
+      case tree :: rest =>
+        tree
+      case Nil =>
+        EmptyTree
+
+    for case imp @ Import(qual, selectors) <- trees do
+      def isAllowedImport(sel: untpd.ImportSelector) =
+        val name = Feature.experimental(sel.name)
+        name == Feature.scala2macros || name == Feature.erasedDefinitions
+
+      languageImport(qual) match
+        case Some(nme.experimental)
+        if !ctx.owner.isInExperimentalScope && !selectors.forall(isAllowedImport) =>
+          def check(stable: => String) =
+            Feature.checkExperimentalFeature("features", imp.srcPos,
+              s"\n\nNote: the scope enclosing the import is not considered experimental because it contains the\nnon-experimental $stable")
+          if ctx.owner.is(Package) then
+            // allow top-level experimental imports if all definitions are @experimental
+            nonExperimentalStat(trees) match
+              case EmptyTree =>
+              case tree: MemberDef => check(i"${tree.symbol}")
+              case tree => check(i"expression ${tree}")
+          else Feature.checkExperimentalFeature("features", imp.srcPos)
+        case _ =>
+  end checkExperimentalImports
 }
 
 trait Checking {
@@ -774,7 +825,7 @@ trait Checking {
             recur(pat1, pt)
           case UnApply(fn, _, pats) =>
             check(pat, pt) &&
-            (isIrrefutable(fn) || fail(pat, pt)) && {
+            (isIrrefutable(fn, pats.length) || fail(pat, pt)) && {
               val argPts = unapplyArgs(fn.tpe.widen.finalResultType, fn, pats, pat.srcPos)
               pats.corresponds(argPts)(recur)
             }
@@ -834,12 +885,13 @@ trait Checking {
    *  that is concurrently compiled in another source file.
    */
   def checkNoModuleClash(sym: Symbol)(using Context): Unit =
-    if sym.effectiveOwner.is(Package)
-       && sym.owner.info.member(sym.name.moduleClassName).symbol.isAbsent()
+    val effectiveOwner = sym.effectiveOwner
+    if effectiveOwner.is(Package)
+       && effectiveOwner.info.member(sym.name.moduleClassName).symbol.isAbsent()
     then
-      val conflicting = sym.owner.info.member(sym.name.toTypeName).symbol
+      val conflicting = effectiveOwner.info.member(sym.name.toTypeName).symbol
       if conflicting.exists then
-        report.error(AlreadyDefined(sym.name, sym.owner, conflicting), sym.srcPos)
+        report.error(AlreadyDefined(sym.name, effectiveOwner, conflicting), sym.srcPos)
 
  /**  Check that `tp` is a class type.
   *   Also, if `traitReq` is true, check that `tp` is a trait.
@@ -861,21 +913,13 @@ trait Checking {
   /** If `sym` is an old-style implicit conversion, check that implicit conversions are enabled.
    *  @pre  sym.is(GivenOrImplicit)
    */
-  def checkImplicitConversionDefOK(sym: Symbol)(using Context): Unit = {
-    def check(): Unit =
+  def checkImplicitConversionDefOK(sym: Symbol)(using Context): Unit =
+    if sym.isOldStyleImplicitConversion(directOnly = true) then
       checkFeature(
         nme.implicitConversions,
         i"Definition of implicit conversion $sym",
         ctx.owner.topLevelClass,
         sym.srcPos)
-
-    sym.info.stripPoly match {
-      case mt @ MethodType(_ :: Nil)
-      if !mt.isImplicitMethod && !sym.is(Synthetic) => // it's an old-styleconversion
-        check()
-      case _ =>
-    }
-  }
 
   /** If `tree` is an application of a new-style implicit conversion (using the apply
    *  method of a `scala.Conversion` instance), check that implicit conversions are
@@ -938,7 +982,7 @@ trait Checking {
                    description: => String,
                    featureUseSite: Symbol,
                    pos: SrcPos)(using Context): Unit =
-    if !enabled(name) then
+    if !Feature.enabled(name) then
       report.featureWarning(name.toString, description, featureUseSite, required = false, pos)
 
   /** Check that `tp` is a class type and that any top-level type arguments in this type
@@ -1165,21 +1209,33 @@ trait Checking {
   /** Check arguments of compiler-defined annotations */
   def checkAnnotArgs(tree: Tree)(using Context): tree.type =
     val cls = Annotations.annotClass(tree)
-    def needsStringLit(arg: Tree) =
-      report.error(em"@${cls.name} needs a string literal as argument", arg.srcPos)
     tree match
       case Apply(tycon, arg :: Nil) if cls == defn.TargetNameAnnot =>
         arg match
+          case Literal(Constant("")) =>
+            report.error(em"target name cannot be empty", arg.srcPos)
           case Literal(_) => // ok
-          case _ => needsStringLit(arg)
+          case _ =>
+            report.error(em"@${cls.name} needs a string literal as argument", arg.srcPos)
       case _ =>
     tree
 
   /** 1. Check that all case classes that extend `scala.reflect.Enum` are `enum` cases
    *  2. Check that parameterised `enum` cases do not extend java.lang.Enum.
    *  3. Check that only a static `enum` base class can extend java.lang.Enum.
+   *  4. Check that user does not implement an `ordinal` method in the body of an enum class.
    */
   def checkEnum(cdef: untpd.TypeDef, cls: Symbol, firstParent: Symbol)(using Context): Unit = {
+    def existingDef(sym: Symbol, clazz: ClassSymbol)(using Context): Symbol = // adapted from SyntheticMembers
+      val existing = sym.matchingMember(clazz.thisType)
+      if existing != sym && !existing.is(Deferred) then existing else NoSymbol
+    def checkExistingOrdinal(using Context) =
+      val decl = existingDef(defn.Enum_ordinal, cls.asClass)
+      if decl.exists then
+        if decl.owner == cls then
+          report.error(em"the ordinal method of enum $cls can not be defined by the user", decl.srcPos)
+        else
+          report.error(em"enum $cls can not inherit the concrete ordinal method of ${decl.owner}", cdef.srcPos)
     def isEnumAnonCls =
       cls.isAnonymousClass
       && cls.owner.isTerm
@@ -1199,6 +1255,8 @@ trait Checking {
         // this test allows inheriting from `Enum` by hand;
         // see enum-List-control.scala.
         report.error(ClassCannotExtendEnum(cls, firstParent), cdef.srcPos)
+    if cls.isEnumClass && !isJavaEnum then
+      checkExistingOrdinal
   }
 
   /** Check that the firstParent for an enum case derives from the declaring enum class, if not, adds it as a parent
@@ -1320,6 +1378,25 @@ trait Checking {
     if !tp.derivesFrom(defn.MatchableClass) && sourceVersion.isAtLeast(`future-migration`) then
       val kind = if pattern then "pattern selector" else "value"
       report.warning(MatchableWarning(tp, pattern), pos)
+
+  def checkCanThrow(tp: Type, span: Span)(using Context): Unit =
+    if Feature.enabled(Feature.saferExceptions) && tp.isCheckedException then
+      ctx.typer.implicitArgTree(defn.CanThrowClass.typeRef.appliedTo(tp), span)
+
+  /** Check that catch can generate a good CanThrow exception */
+  def checkCatch(pat: Tree, guard: Tree)(using Context): Unit = pat match
+    case Typed(_: Ident, tpt) if isFullyDefined(tpt.tpe, ForceDegree.none) && guard.isEmpty =>
+      // OK
+    case Bind(_, pat1) =>
+      checkCatch(pat1, guard)
+    case _ =>
+      val req =
+        if guard.isEmpty then "for cases of the form `ex: T` where `T` is fully defined"
+        else "if no pattern guard is given"
+      report.error(
+        em"""Implementation restriction: cannot generate CanThrow capability for this kind of catch.
+            |CanThrow capabilities can only be generated $req.""",
+        pat.srcPos)
 }
 
 trait ReChecking extends Checking {
@@ -1332,6 +1409,8 @@ trait ReChecking extends Checking {
   override def checkAnnotApplicable(annot: Tree, sym: Symbol)(using Context): Boolean = true
   override def checkMatchable(tp: Type, pos: SrcPos, pattern: Boolean)(using Context): Unit = ()
   override def checkNoModuleClash(sym: Symbol)(using Context) = ()
+  override def checkCanThrow(tp: Type, span: Span)(using Context): Unit = ()
+  override def checkCatch(pat: Tree, guard: Tree)(using Context): Unit = ()
 }
 
 trait NoChecking extends ReChecking {

@@ -7,8 +7,7 @@
   |
   |                                     trying to reduce  Test.Sub[O]
   |                                     failed since selector  O
-  |                                     matches none of the cases
+  |                                     does not match  case Test.Of[sup, sub] => sub
+  |                                     and cannot be shown to be disjoint from it either.
   |
-  |                                       case Test.Of[sup, sub] => sub
-
-longer explanation available when compiling with `-explain`
+  | longer explanation available when compiling with `-explain`

@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.nio.file.Files
 import scala.sys.process._
 
+import CommunityBuildRunner.run
 
 object Main:
 
@@ -56,7 +57,7 @@ object Main:
         val (toRun, ignored) =
           allProjects.partition( p =>
             p.docCommand != null
-            && (!p.requiresExperimental || compilerSupportExperimental)
+            && (!p.requiresExperimental || p.compilerSupportExperimental)
           )
 
         val paths = toRun.map { project =>
@@ -106,12 +107,15 @@ object Main:
           println(s"Documentation not found for ${failed.mkString(", ")}")
           sys.exit(1)
 
+      case "run" :: names if names.nonEmpty =>
+        given CommunityBuildRunner()
+        withProjects(names, "Running")(_.run())
+
       case args =>
         println("USAGE: <COMMAND> <PROJECT NAME>")
-        println("COMMAND is one of: publish doc run")
+        println("COMMAND is one of: publish, build, doc, doc all, run")
         println("Available projects are:")
         allProjects.foreach { k =>
           println(s"\t${k.project}")
         }
         sys.exit(1)
-

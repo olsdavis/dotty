@@ -87,7 +87,44 @@ object SymUtils:
 
     def isGenericProduct(using Context): Boolean = whyNotGenericProduct.isEmpty
 
-    def useCompanionAsMirror(using Context): Boolean = self.linkedClass.exists && !self.is(Scala2x)
+    /** Is this an old style implicit conversion?
+     *  @param directOnly            only consider explicitly written methods
+     *  @param forImplicitClassOnly  only consider methods generated from implicit classes
+     */
+    def isOldStyleImplicitConversion(directOnly: Boolean = false, forImplicitClassOnly: Boolean = false)(using Context): Boolean =
+      self.is(Implicit) && self.info.stripPoly.match
+        case mt @ MethodType(_ :: Nil) if !mt.isImplicitMethod =>
+          if self.isCoDefinedGiven(mt.finalResultType.typeSymbol)
+          then !directOnly
+          else !forImplicitClassOnly
+        case _ =>
+          false
+
+    /** Is this the method that summons a structural given instance? */
+    def isGivenInstanceSummoner(using Context): Boolean =
+      def isCodefined(info: Type): Boolean = info.stripPoly match
+        case mt: MethodType =>
+          // given summoner can only have contextual params
+          mt.isImplicitMethod && isCodefined(mt.resultType)
+        case mt: ExprType =>
+          isCodefined(mt.resultType)
+        case res =>
+          self.isCoDefinedGiven(res.typeSymbol)
+      self.isAllOf(Given | Method) && isCodefined(self.info)
+
+    def useCompanionAsSumMirror(using Context): Boolean =
+      self.linkedClass.exists
+      && !self.is(Scala2x)
+      && (
+        // If the sum type is compiled from source, and `self` is a "generic sum"
+        // then its companion object will become a sum mirror in `posttyper`. (This method
+        // can be called from `typer` when summoning a Mirror.)
+        // However if `self` is from a prior run then we should check that its companion subclasses `Mirror.Sum`.
+        // e.g. before Scala 3.1, hierarchical sum types were not considered "generic sums", so their
+        // companion would not cache the mirror. Companions from TASTy will already be typed as `Mirror.Sum`.
+        self.isDefinedInCurrentRun
+        || self.linkedClass.isSubClass(defn.Mirror_SumClass)
+      )
 
     /** Is this a sealed class or trait for which a sum mirror is generated?
     *  It must satisfy the following conditions:
@@ -95,7 +132,7 @@ object SymUtils:
     *   - none of its children are anonymous classes
     *   - all of its children are addressable through a path from the parent class
     *     and also the location of the generated mirror.
-    *   - all of its children are generic products or singletons
+    *   - all of its children are generic products, singletons, or generic sums themselves.
     */
     def whyNotGenericSum(declScope: Symbol)(using Context): String =
       if (!self.is(Sealed))
@@ -104,7 +141,7 @@ object SymUtils:
         s"it is not an abstract class"
       else {
         val children = self.children
-        val companionMirror = self.useCompanionAsMirror
+        val companionMirror = self.useCompanionAsSumMirror
         assert(!(companionMirror && (declScope ne self.linkedClass)))
         def problem(child: Symbol) = {
 
@@ -118,7 +155,11 @@ object SymUtils:
           else {
             val s = child.whyNotGenericProduct
             if (s.isEmpty) s
-            else i"its child $child is not a generic product because $s"
+            else if (child.is(Sealed)) {
+              val s = child.whyNotGenericSum(if child.useCompanionAsSumMirror then child.linkedClass else ctx.owner)
+              if (s.isEmpty) s
+              else i"its child $child is not a generic sum because $s"
+            } else i"its child $child is not a generic product because $s"
           }
         }
         if (children.isEmpty) "it does not have subclasses"
@@ -263,10 +304,22 @@ object SymUtils:
 
     /** Is symbol declared or inherits @experimental? */
     def isExperimental(using Context): Boolean =
-      // TODO should be add `@experimental` to `class experimental` in PostTyper?
-      self.eq(defn.ExperimentalAnnot)
-      || self.hasAnnotation(defn.ExperimentalAnnot)
+      self.hasAnnotation(defn.ExperimentalAnnot)
       || (self.maybeOwner.isClass && self.owner.hasAnnotation(defn.ExperimentalAnnot))
+
+    def isInExperimentalScope(using Context): Boolean =
+      def isDefaultArgumentOfExperimentalMethod =
+        self.name.is(DefaultGetterName)
+        && self.owner.isClass
+        && {
+          val overloads = self.owner.asClass.membersNamed(self.name.firstPart)
+          overloads.filterWithFlags(HasDefaultParams, EmptyFlags) match
+            case denot: SymDenotation => denot.symbol.isExperimental
+            case _ => false
+        }
+      self.hasAnnotation(defn.ExperimentalAnnot)
+      || isDefaultArgumentOfExperimentalMethod
+      || (!self.is(Package) && self.owner.isInExperimentalScope)
 
     /** The declared self type of this class, as seen from `site`, stripping
     *  all refinements for opaque types.

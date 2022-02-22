@@ -98,7 +98,7 @@ goto :eof
 
 @rem output parameter: _CLASS_PATH
 :classpathArgs
-for /f %%f in ("%_PROG_HOME%\.") do set "_LIB_DIR=%%~dpflib"
+for /f "delims=" %%f in ("%_PROG_HOME%\.") do set "_LIB_DIR=%%~dpflib"
 set _CLASS_PATH=
 @rem keep list in sync with bash script `bin\scaladoc` !
 call :updateClasspath "scaladoc"
@@ -120,6 +120,8 @@ call :updateClasspath "flexmark-ext-yaml-front-matter"
 call :updateClasspath "liqp"
 call :updateClasspath "jsoup"
 call :updateClasspath "jackson-dataformat-yaml"
+call :updateClasspath "jackson-datatype-jsr310"
+call :updateClasspath "strftime4j"
 call :updateClasspath "scala-asm"
 call :updateClasspath "compiler-interface"
 call :updateClasspath "jline-reader"
@@ -129,7 +131,7 @@ call :updateClasspath "flexmark-util"
 call :updateClasspath "flexmark-formatter"
 call :updateClasspath "autolink-0.6"
 call :updateClasspath "flexmark-jira-converter"
-call :updateClasspath "antlr-3"
+call :updateClasspath "antlr4"
 call :updateClasspath "jackson-annotations"
 call :updateClasspath "jackson-core"
 call :updateClasspath "jackson-databind"
@@ -141,7 +143,7 @@ call :updateClasspath "jna-5"
 call :updateClasspath "flexmark-ext-tables"
 call :updateClasspath "flexmark-ext-ins"
 call :updateClasspath "flexmark-ext-superscript"
-call :updateClasspath "antlr-runtime-3"
+call :updateClasspath "antlr4-runtime"
 call :updateClasspath "ST4"
 goto :eof
 
@@ -149,7 +151,7 @@ goto :eof
 @rem output parameter: _CLASS_PATH
 :updateClasspath
 set "__PATTERN=%~1"
-for /f %%f in ('dir /a-d /b "%_LIB_DIR%\*%__PATTERN%*"') do (
+for /f "delims=" %%f in ('dir /a-d /b "%_LIB_DIR%\*%__PATTERN%*"') do (
     set "_CLASS_PATH=!_CLASS_PATH!%_LIB_DIR%\%%f%_PSEP%"
 )
 goto :eof

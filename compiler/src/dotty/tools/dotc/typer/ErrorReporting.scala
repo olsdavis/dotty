@@ -131,7 +131,7 @@ object ErrorReporting {
         case If(_, _, elsep @ Literal(Constant(()))) if elsep.span.isSynthetic =>
           "\nMaybe you are missing an else part for the conditional?"
         case _ => ""
-      errorTree(tree, TypeMismatch(treeTp, pt, implicitFailure.whyNoConversion, missingElse))
+      errorTree(tree, TypeMismatch(treeTp, pt, Some(tree), implicitFailure.whyNoConversion, missingElse))
     }
 
     /** A subtype log explaining why `found` does not conform to `expected` */
@@ -142,18 +142,17 @@ object ErrorReporting {
           |conforms to
           |  $expected
           |but the comparison trace ended with `false`:
-          """
+          |"""
       val c = ctx.typerState.constraint
       val constraintText =
         if c.domainLambdas.isEmpty then
           "the empty constraint"
         else
           i"""a constraint with:
-             |${c.contentsToString}"""
-      i"""
-        |${TypeComparer.explained(_.isSubType(found, expected), header)}
-        |
-        |The tests were made under $constraintText"""
+             |$c"""
+      i"""${TypeComparer.explained(_.isSubType(found, expected), header)}
+         |
+         |The tests were made under $constraintText"""
 
     /** Format `raw` implicitNotFound or implicitAmbiguous argument, replacing
      *  all occurrences of `${X}` where `X` is in `paramNames` with the
@@ -240,7 +239,6 @@ object ErrorReporting {
   def err(using Context): Errors = new Errors
 }
 
-
 class ImplicitSearchError(
   arg: tpd.Tree,
   pt: Type,
@@ -249,6 +247,7 @@ class ImplicitSearchError(
   ignoredInstanceNormalImport: => Option[SearchSuccess],
   importSuggestionAddendum: => String
 )(using ctx: Context) {
+
   def missingArgMsg = arg.tpe match {
     case ambi: AmbiguousImplicits =>
       (ambi.alt1, ambi.alt2) match {

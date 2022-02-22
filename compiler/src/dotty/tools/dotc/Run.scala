@@ -9,20 +9,20 @@ import Types._
 import Scopes._
 import Names.Name
 import Denotations.Denotation
-import typer.Typer
+import typer.{Typer, PrepareInlineable}
 import typer.ImportInfo._
 import Decorators._
 import io.{AbstractFile, PlainFile, VirtualFile}
 import Phases.unfusedPhases
 
 import util._
-import reporting.Reporter
+import reporting.{Reporter, Suppression, Action}
+import reporting.Diagnostic
+import reporting.Diagnostic.Warning
 import rewrites.Rewrites
 
 import profile.Profiler
 import printing.XprintMode
-import parsing.Parsers.Parser
-import parsing.JavaParsers.JavaParser
 import typer.ImplicitRunInfo
 import config.Feature
 import StdNames.nme
@@ -57,44 +57,65 @@ class Run(comp: Compiler, ictx: Context) extends ImplicitRunInfo with Constraint
    */
   @volatile var isCancelled = false
 
-  /** Produces the following contexts, from outermost to innermost
-   *
-   *    bootStrap:   A context with next available runId and a scope consisting of
-   *                 the RootPackage _root_
-   *    start        A context with RootClass as owner and the necessary initializations
-   *                 for type checking.
-   *    imports      For each element of RootImports, an import context
-   */
-  protected def rootContext(using Context): Context = {
-    ctx.initialize()
-    ctx.base.setPhasePlan(comp.phases)
-    val rootScope = new MutableScope
-    val bootstrap = ctx.fresh
-      .setPeriod(Period(comp.nextRunId, FirstPhaseId))
-      .setScope(rootScope)
-    rootScope.enter(ctx.definitions.RootPackage)(using bootstrap)
-    var start = bootstrap.fresh
-      .setOwner(defn.RootClass)
-      .setTyper(new Typer)
-      .addMode(Mode.ImplicitsEnabled)
-      .setTyperState(ctx.typerState.fresh(ctx.reporter))
-    if ctx.settings.YexplicitNulls.value && !Feature.enabledBySetting(nme.unsafeNulls) then
-      start = start.addMode(Mode.SafeNulls)
-    ctx.initialize()(using start) // re-initialize the base context with start
-    start.setRun(this)
-  }
-
   private var compiling = false
-
-  private var myCtx = rootContext(using ictx)
-
-  /** The context created for this run */
-  given runContext[Dummy_so_its_a_def]: Context = myCtx
-  assert(runContext.runId <= Periods.MaxPossibleRunId)
 
   private var myUnits: List[CompilationUnit] = _
   private var myUnitsCached: List[CompilationUnit] = _
   private var myFiles: Set[AbstractFile] = _
+
+  // `@nowarn` annotations by source file, populated during typer
+  private val mySuppressions: mutable.LinkedHashMap[SourceFile, mutable.ListBuffer[Suppression]] = mutable.LinkedHashMap.empty
+  // source files whose `@nowarn` annotations are processed
+  private val mySuppressionsComplete: mutable.Set[SourceFile] = mutable.Set.empty
+  // warnings issued before a source file's `@nowarn` annotations are processed, suspended so that `@nowarn` can filter them
+  private val mySuspendedMessages: mutable.LinkedHashMap[SourceFile, mutable.LinkedHashSet[Warning]] = mutable.LinkedHashMap.empty
+
+  object suppressions:
+    // When the REPL creates a new run (ReplDriver.compile), parsing is already done in the old context, with the
+    // previous Run. Parser warnings were suspended in the old run and need to be copied over so they are not lost.
+    // Same as scala/scala/commit/79ca1408c7.
+    def initSuspendedMessages(oldRun: Run) = if oldRun != null then
+      mySuspendedMessages.clear()
+      mySuspendedMessages ++= oldRun.mySuspendedMessages
+
+    def suppressionsComplete(source: SourceFile) = source == NoSource || mySuppressionsComplete(source)
+
+    def addSuspendedMessage(warning: Warning) =
+      mySuspendedMessages.getOrElseUpdate(warning.pos.source, mutable.LinkedHashSet.empty) += warning
+
+    def nowarnAction(dia: Diagnostic): Action.Warning.type | Action.Verbose.type | Action.Silent.type =
+      mySuppressions.getOrElse(dia.pos.source, Nil).find(_.matches(dia)) match {
+        case Some(s) =>
+          s.markUsed()
+          if (s.verbose) Action.Verbose
+          else Action.Silent
+        case _ =>
+          Action.Warning
+      }
+
+    def addSuppression(sup: Suppression): Unit =
+      val source = sup.annotPos.source
+      mySuppressions.getOrElseUpdate(source, mutable.ListBuffer.empty) += sup
+
+    def reportSuspendedMessages(source: SourceFile)(using Context): Unit = {
+      // sort suppressions. they are not added in any particular order because of lazy type completion
+      for (sups <- mySuppressions.get(source))
+        mySuppressions(source) = sups.sortBy(sup => 0 - sup.start)
+      mySuppressionsComplete += source
+      mySuspendedMessages.remove(source).foreach(_.foreach(ctx.reporter.issueIfNotSuppressed))
+    }
+
+    def runFinished(hasErrors: Boolean): Unit =
+      // report suspended messages (in case the run finished before typer)
+      mySuspendedMessages.keysIterator.toList.foreach(reportSuspendedMessages)
+      // report unused nowarns only if all all phases are done
+      if !hasErrors && ctx.settings.WunusedHas.nowarn then
+        for {
+          source <- mySuppressions.keysIterator.toList
+          sups   <- mySuppressions.remove(source)
+          sup    <- sups.reverse
+        } if (!sup.used)
+          report.warning("@nowarn annotation does not suppress any warnings", sup.annotPos)
 
   /** The compilation units currently being compiled, this may return different
    *  results over time.
@@ -222,7 +243,9 @@ class Run(comp: Compiler, ictx: Context) extends ImplicitRunInfo with Constraint
     runCtx.setProfiler(Profiler())
     unfusedPhases.foreach(_.initContext(runCtx))
     runPhases(using runCtx)
-    if (!ctx.reporter.hasErrors) Rewrites.writeBack()
+    if (!ctx.reporter.hasErrors)
+      Rewrites.writeBack()
+    suppressions.runFinished(hasErrors = ctx.reporter.hasErrors)
     while (finalizeActions.nonEmpty) {
       val action = finalizeActions.remove(0)
       action()
@@ -244,19 +267,13 @@ class Run(comp: Compiler, ictx: Context) extends ImplicitRunInfo with Constraint
         .setCompilationUnit(unit)
         .withRootImports
 
-      def process()(using Context) = {
-        unit.untpdTree =
-          if (unit.isJava) new JavaParser(unit.source).parse()
-          else new Parser(unit.source).parse()
-        ctx.typer.lateEnter(unit.untpdTree)
-        def processUnit() = {
-          unit.tpdTree = ctx.typer.typedExpr(unit.untpdTree)
-          val phase = new transform.SetRootTree()
-          phase.run
-        }
-        if (typeCheck)
-          if (compiling) finalizeActions += (() => processUnit()) else processUnit()
-      }
+      def process()(using Context) =
+        ctx.typer.lateEnterUnit(doTypeCheck =>
+          if typeCheck then
+            if compiling then finalizeActions += doTypeCheck
+            else doTypeCheck()
+        )
+
       process()(using unitCtx)
     }
 
@@ -268,25 +285,23 @@ class Run(comp: Compiler, ictx: Context) extends ImplicitRunInfo with Constraint
     val unit = ctx.compilationUnit
     val prevPhase = ctx.phase.prev // can be a mini-phase
     val fusedPhase = ctx.base.fusedContaining(prevPhase)
-    val treeString = unit.tpdTree.show(using ctx.withProperty(XprintMode, Some(())))
-
-    report.echo(s"result of $unit after $fusedPhase:")
+    val echoHeader = f"[[syntax trees at end of $fusedPhase%25s]] // ${unit.source}"
+    val tree = if ctx.isAfterTyper then unit.tpdTree else unit.untpdTree
+    val treeString = tree.show(using ctx.withProperty(XprintMode, Some(())))
 
     last match {
-      case SomePrintedTree(phase, lastTreeSting) if lastTreeSting != treeString =>
-        val msg =
-          if (!ctx.settings.XprintDiff.value && !ctx.settings.XprintDiffDel.value) treeString
-          else DiffUtil.mkColoredCodeDiff(treeString, lastTreeSting, ctx.settings.XprintDiffDel.value)
-        report.echo(msg)
-        SomePrintedTree(fusedPhase.toString, treeString)
-
-      case SomePrintedTree(phase, lastTreeSting) =>
-        report.echo("  Unchanged since " + phase)
+      case SomePrintedTree(phase, lastTreeString) if lastTreeString == treeString =>
+        report.echo(s"$echoHeader: unchanged since $phase")
         last
 
-      case NoPrintedTree =>
-        report.echo(treeString)
-        SomePrintedTree(fusedPhase.toString, treeString)
+      case SomePrintedTree(phase, lastTreeString) if ctx.settings.XprintDiff.value || ctx.settings.XprintDiffDel.value =>
+        val diff = DiffUtil.mkColoredCodeDiff(treeString, lastTreeString, ctx.settings.XprintDiffDel.value)
+        report.echo(s"$echoHeader\n$diff\n")
+        SomePrintedTree(fusedPhase.phaseName, treeString)
+
+      case _ =>
+        report.echo(s"$echoHeader\n$treeString\n")
+        SomePrintedTree(fusedPhase.phaseName, treeString)
     }
   }
 
@@ -321,4 +336,40 @@ class Run(comp: Compiler, ictx: Context) extends ImplicitRunInfo with Constraint
     myUnits = null
     myUnitsCached = null
   }
+
+  /** Produces the following contexts, from outermost to innermost
+   *
+   *    bootStrap:   A context with next available runId and a scope consisting of
+   *                 the RootPackage _root_
+   *    start        A context with RootClass as owner and the necessary initializations
+   *                 for type checking.
+   *    imports      For each element of RootImports, an import context
+   */
+  protected def rootContext(using Context): Context = {
+    ctx.initialize()
+    ctx.base.setPhasePlan(comp.phases)
+    val rootScope = new MutableScope(0)
+    val bootstrap = ctx.fresh
+      .setPeriod(Period(comp.nextRunId, FirstPhaseId))
+      .setScope(rootScope)
+    rootScope.enter(ctx.definitions.RootPackage)(using bootstrap)
+    var start = bootstrap.fresh
+      .setOwner(defn.RootClass)
+      .setTyper(new Typer)
+      .addMode(Mode.ImplicitsEnabled)
+      .setTyperState(ctx.typerState.fresh(ctx.reporter))
+    if ctx.settings.YexplicitNulls.value && !Feature.enabledBySetting(nme.unsafeNulls) then
+      start = start.addMode(Mode.SafeNulls)
+    ctx.initialize()(using start) // re-initialize the base context with start
+
+    // `this` must be unchecked for safe initialization because by being passed to setRun during
+    // initialization, it is not yet considered fully initialized by the initialization checker
+    start.setRun(this: @unchecked)
+  }
+
+  private var myCtx = rootContext(using ictx)
+
+  /** The context created for this run */
+  given runContext[Dummy_so_its_a_def]: Context = myCtx
+  assert(runContext.runId <= Periods.MaxPossibleRunId)
 }

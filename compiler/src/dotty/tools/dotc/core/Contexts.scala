@@ -13,7 +13,6 @@ import Scopes._
 import Uniques._
 import ast.Trees._
 import ast.untpd
-import Flags.GivenOrImplicit
 import util.{NoSource, SimpleIdentityMap, SourceFile, HashSet, ReusableInstance}
 import typer.{Implicits, ImportInfo, Inliner, SearchHistory, SearchRoot, TypeAssigner, Typer, Nullables}
 import Nullables._
@@ -25,7 +24,7 @@ import io.{AbstractFile, NoAbstractFile, PlainFile, Path}
 import scala.io.Codec
 import collection.mutable
 import printing._
-import config.{JavaPlatform, SJSPlatform, Platform, ScalaSettings}
+import config.{JavaPlatform, SJSPlatform, Platform, ScalaSettings, ScalaRelease}
 import classfile.ReusableDataReader
 import StdNames.nme
 
@@ -39,6 +38,9 @@ import xsbti.AnalysisCallback
 import plugins._
 import java.util.concurrent.atomic.AtomicInteger
 import java.nio.file.InvalidPathException
+import dotty.tools.tasty.TastyFormat
+import dotty.tools.dotc.config.{ NoScalaVersion, SpecificScalaVersion, AnyScalaVersion, ScalaBuild }
+import dotty.tools.dotc.core.tasty.TastyVersion
 
 object Contexts {
 
@@ -271,6 +273,10 @@ object Contexts {
       if owner != null && owner.isClass then owner.asClass.unforcedDecls
       else scope
 
+    def nestingLevel: Int =
+      val sc = effectiveScope
+      if sc != null then sc.nestingLevel else 0
+
     /** Sourcefile corresponding to given abstract file, memoized */
     def getSource(file: AbstractFile, codec: => Codec = Codec(settings.encoding.value)) = {
       util.Stats.record("Context.getSource")
@@ -388,8 +394,9 @@ object Contexts {
       // to be used as a default value.
       compilationUnit != null && compilationUnit.isJava
 
-    /** Is current phase after FrontEnd? */
+    /** Is current phase after TyperPhase? */
     final def isAfterTyper = base.isAfterTyper(phase)
+    final def isTyper = base.isTyper(phase)
 
     /** Is this a context for the members of a class definition? */
     def isClassDefContext: Boolean =
@@ -476,7 +483,22 @@ object Contexts {
 
     /** A new context that summarizes an import statement */
     def importContext(imp: Import[?], sym: Symbol): FreshContext =
-       fresh.setImportInfo(ImportInfo(sym, imp.selectors, imp.expr))
+      fresh.setImportInfo(ImportInfo(sym, imp.selectors, imp.expr))
+
+    def scalaRelease: ScalaRelease =
+      val releaseName = base.settings.YscalaRelease.value
+      if releaseName.nonEmpty then ScalaRelease.parse(releaseName).get else ScalaRelease.latest
+
+    def tastyVersion: TastyVersion =
+      import math.Ordered.orderingToOrdered
+      val latestRelease = ScalaRelease.latest
+      val specifiedRelease = scalaRelease
+      if specifiedRelease < latestRelease then
+        // This is needed to make -Yscala-release a no-op when set to the latest release for unstable versions of the compiler
+        // (which might have the tasty format version numbers set to higher values before they're decreased during a release)
+        TastyVersion.fromStableScalaRelease(specifiedRelease.majorVersion, specifiedRelease.minorVersion)
+      else
+        TastyVersion.compilerVersion
 
     /** Is the debug option set? */
     def debug: Boolean = base.settings.Ydebug.value
@@ -526,9 +548,11 @@ object Contexts {
     final def withOwner(owner: Symbol): Context =
       if (owner ne this.owner) fresh.setOwner(owner) else this
 
+    final def withTyperState(typerState: TyperState): Context =
+      if typerState ne this.typerState then fresh.setTyperState(typerState) else this
+
     final def withUncommittedTyperState: Context =
-      val ts = typerState.uncommittedAncestor
-      if ts ne typerState then fresh.setTyperState(ts) else this
+      withTyperState(typerState.uncommittedAncestor)
 
     final def withProperty[T](key: Key[T], value: Option[T]): Context =
       if (property(key) == value) this
@@ -599,8 +623,8 @@ object Contexts {
       this.scope = newScope
       this
     def setTyperState(typerState: TyperState): this.type = { this.typerState = typerState; this }
-    def setNewTyperState(): this.type = setTyperState(typerState.fresh().setCommittable(true))
-    def setExploreTyperState(): this.type = setTyperState(typerState.fresh().setCommittable(false))
+    def setNewTyperState(): this.type = setTyperState(typerState.fresh(committable = true))
+    def setExploreTyperState(): this.type = setTyperState(typerState.fresh(committable = false))
     def setReporter(reporter: Reporter): this.type = setTyperState(typerState.fresh().setReporter(reporter))
     def setTyper(typer: Typer): this.type = { this.scope = typer.scope; setTypeAssigner(typer) }
     def setGadt(gadt: GadtConstraint): this.type =
@@ -688,6 +712,9 @@ object Contexts {
 
       def withNotNullInfos(infos: List[NotNullInfo]): Context =
         if c.notNullInfos eq infos then c else c.fresh.setNotNullInfos(infos)
+
+      def relaxedOverrideContext: Context =
+        c.withModeBits(c.mode &~ Mode.SafeNulls | Mode.RelaxedOverriding)
   end ops
 
   // TODO: Fix issue when converting ModeChanges and FreshModeChanges to extension givens
@@ -929,6 +956,17 @@ object Contexts {
     /** Flag to suppress inlining, set after overflow */
     private[dotc] var stopInlining: Boolean = false
 
+    /** A variable that records that some error was reported in a globally committable context.
+     *  The error will not necessarlily be emitted, since it could still be that
+     *  the enclosing context will be aborted. The variable is used as a smoke test
+     *  to turn off assertions that might be wrong if the program is erroneous. To
+     *  just test for `ctx.reporter.errorsReported` is not always enough, since it
+     *  could be that the context in which the assertion is tested is a completer context
+     *  that's different from the context where the error was reported. See i13218.scala
+     *  for a test.
+     */
+    private[dotc] var errorsToBeReported = false
+
     // Reporters state
     private[dotc] var indent: Int = 0
 
@@ -947,6 +985,8 @@ object Contexts {
 
     private[core] val reusableDataReader = ReusableInstance(new ReusableDataReader())
 
+    private[dotc] var wConfCache: (List[String], WConf) = _
+
     def sharedCharArray(len: Int): Array[Char] =
       while len > charArray.length do
         charArray = new Array[Char](charArray.length * 2)
@@ -958,6 +998,7 @@ object Contexts {
       uniqueNamedTypes.clear()
       emptyTypeBounds = null
       emptyWildcardBounds = null
+      errorsToBeReported = false
       errorTypeMsg.clear()
       sources.clear()
       files.clear()

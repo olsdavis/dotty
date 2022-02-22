@@ -12,7 +12,7 @@ import core.Types._
 import core.Names._
 import core.StdNames._
 import core.NameOps._
-import core.NameKinds.{AdaptedClosureName, BodyRetainerName}
+import core.NameKinds.{AdaptedClosureName, BodyRetainerName, DirectMethName}
 import core.Scopes.newScopeWith
 import core.Decorators._
 import core.Constants._
@@ -42,6 +42,8 @@ class Erasure extends Phase with DenotTransformer {
 
   override def phaseName: String = Erasure.name
 
+  override def description: String = Erasure.description
+
   /** List of names of phases that should precede this phase */
   override def runsAfter: Set[String] = Set(InterceptedMethods.name, ElimRepeated.name)
 
@@ -57,6 +59,18 @@ class Erasure extends Phase with DenotTransformer {
             case _                              => false
           }
         }
+
+      def erasedName =
+        if ref.is(Flags.Method)
+            && contextResultsAreErased(ref.symbol)
+            && (ref.owner.is(Flags.Trait) || ref.symbol.allOverriddenSymbols.hasNext)
+        then
+          // Add a `$direct` to prevent this method from having the same signature
+          // as a method it overrides. We need a bridge between the
+          // two methods, so they are not allowed to already override after erasure.
+          DirectMethName(ref.targetName.asTermName)
+        else
+          ref.targetName
 
       assert(ctx.phase == this, s"transforming $ref at ${ctx.phase}")
       if (ref.symbol eq defn.ObjectClass) {
@@ -80,7 +94,7 @@ class Erasure extends Phase with DenotTransformer {
         val oldOwner = ref.owner
         val newOwner = if oldOwner == defn.AnyClass then defn.ObjectClass else oldOwner
         val oldName = ref.name
-        val newName = ref.targetName
+        val newName = erasedName
         val oldInfo = ref.info
         var newInfo = transformInfo(oldSymbol, oldInfo)
         val oldFlags = ref.flags
@@ -191,6 +205,7 @@ object Erasure {
   import TypeTestsCasts._
 
   val name: String = "erasure"
+  val description: String = "rewrite types to JVM model"
 
   /** An attachment on Apply nodes indicating that multiple arguments
    *  are passed in a single array. This occurs only if the function
@@ -325,6 +340,13 @@ object Erasure {
       assert(!pt.isInstanceOf[SingletonType], pt)
       if (pt isRef defn.UnitClass) unbox(tree, pt)
       else (tree.tpe.widen, pt) match {
+        // Convert primitive arrays into reference arrays, this path is only
+        // needed to handle repeated arguments, see
+        // `Definitions#FromJavaObjectSymbol` and `ElimRepeated#adaptToArray`.
+        case (JavaArrayType(treeElem), JavaArrayType(ptElem))
+        if treeElem.widen.isPrimitiveValueType && !ptElem.isPrimitiveValueType =>
+          cast(ref(defn.ScalaRuntime_toObjectArray).appliedTo(tree), pt)
+
         // When casting between two EVTs, we need to check which one underlies the other to determine
         // whether u2evt or evt2u should be used.
         case (tp1 @ ErasedValueType(tycon1, underlying1), tp2 @ ErasedValueType(tycon2, underlying2)) =>
@@ -365,8 +387,8 @@ object Erasure {
       case _: FunProto | AnyFunctionProto => tree
       case _ => tree.tpe.widen match
         case mt: MethodType if tree.isTerm =>
-          if mt.paramInfos.isEmpty then adaptToType(tree.appliedToNone, pt)
-          else etaExpand(tree, mt, pt)
+          assert(mt.paramInfos.isEmpty)
+          adaptToType(tree.appliedToNone, pt)
         case tpw =>
           if (pt.isInstanceOf[ProtoType] || tree.tpe <:< pt)
             tree
@@ -384,7 +406,6 @@ object Erasure {
           else
             cast(tree, pt)
     end adaptToType
-
 
     /** The following code:
      *
@@ -516,61 +537,6 @@ object Erasure {
       else
         tree
     end adaptClosure
-
-    /** Eta expand given `tree` that has the given method type `mt`, so that
-     *  it conforms to erased result type `pt`.
-     *  To do this correctly, we have to look at the tree's original pre-erasure
-     *  type and figure out which context function types in its result are
-     *  not yet instantiated.
-     */
-    def etaExpand(tree: Tree, mt: MethodType, pt: Type)(using Context): Tree =
-      report.log(i"eta expanding $tree")
-      val defs = new mutable.ListBuffer[Tree]
-      val tree1 = LiftErased.liftApp(defs, tree)
-      val xmt = if tree.isInstanceOf[Apply] then mt else expandedMethodType(mt, tree)
-      val targetLength = xmt.paramInfos.length
-      val origOwner = ctx.owner
-
-      // The original type from which closures should be constructed
-      val origType = contextFunctionResultTypeCovering(tree.symbol, targetLength)
-
-      def abstracted(args: List[Tree], tp: Type, pt: Type)(using Context): Tree =
-        if args.length < targetLength then
-          try
-            val defn.ContextFunctionType(argTpes, resTpe, isErased) = tp: @unchecked
-            if isErased then abstracted(args, resTpe, pt)
-            else
-              val anonFun = newSymbol(
-                ctx.owner, nme.ANON_FUN, Flags.Synthetic | Flags.Method,
-                MethodType(argTpes, resTpe), coord = tree.span.endPos)
-              anonFun.info = transformInfo(anonFun, anonFun.info)
-              def lambdaBody(refss: List[List[Tree]]) =
-                val refs :: Nil = refss: @unchecked
-                val expandedRefs = refs.map(_.withSpan(tree.span.endPos)) match
-                  case (bunchedParam @ Ident(nme.ALLARGS)) :: Nil =>
-                    argTpes.indices.toList.map(n =>
-                      bunchedParam
-                        .select(nme.primitive.arrayApply)
-                        .appliedTo(Literal(Constant(n))))
-                  case refs1 => refs1
-                abstracted(args ::: expandedRefs, resTpe, anonFun.info.finalResultType)(
-                  using ctx.withOwner(anonFun))
-
-              val unadapted = Closure(anonFun, lambdaBody)
-              cpy.Block(unadapted)(unadapted.stats, adaptClosure(unadapted.expr.asInstanceOf[Closure]))
-          catch case ex: MatchError =>
-            println(i"error while abstracting tree = $tree | mt = $mt | args = $args%, % | tp = $tp | pt = $pt")
-            throw ex
-        else
-          assert(args.length == targetLength, i"wrong # args tree = $tree | args = $args%, % | mt = $mt | tree type = ${tree.tpe}")
-          val app = untpd.cpy.Apply(tree1)(tree1, args)
-          assert(ctx.typer.isInstanceOf[Erasure.Typer])
-          ctx.typer.typed(app, pt)
-            .changeOwnerAfter(origOwner, ctx.owner, erasurePhase.asInstanceOf[Erasure])
-
-      seq(defs.toList, abstracted(Nil, origType, pt))
-    end etaExpand
-
   end Boxing
 
   class Typer(erasurePhase: DenotTransformer) extends typer.ReTyper with NoChecking {
@@ -586,8 +552,14 @@ object Erasure {
       */
     private def checkNotErased(tree: Tree)(using Context): tree.type = {
       if (!ctx.mode.is(Mode.Type)) {
-        if (isErased(tree))
-          report.error(em"${tree.symbol} is declared as erased, but is in fact used", tree.srcPos)
+        if isErased(tree) then
+          val msg =
+            if tree.symbol.is(Flags.Inline) then
+              em"""${tree.symbol} is declared as `inline`, but was not inlined
+                  |
+                  |Try increasing `-Xmax-inlines` above ${ctx.settings.XmaxInlines.value}""".stripMargin
+            else em"${tree.symbol} is declared as `erased`, but is in fact used"
+          report.error(msg, tree.srcPos)
         tree.symbol.getAnnotation(defn.CompileTimeOnlyAnnot) match {
           case Some(annot) =>
             def defaultMsg =
@@ -698,16 +670,24 @@ object Erasure {
       def mapOwner(sym: Symbol): Symbol =
         if !sym.exists && tree.name == nme.apply then
           // PolyFunction apply Selects will not have a symbol, so deduce the owner
-          // from the typed qual.
-          val owner = qual1.tpe.typeSymbol
-          if defn.isFunctionClass(owner) then owner else NoSymbol
+          // from the typed tree of the erasure of the original qualifier's PolyFunction type.
+          // We cannot simply call `erasure` on the qualifier because its erasure might be
+          // `Object` due to how we erase intersections (see pos/i13950.scala).
+          // Instead, we manually lookup the type of `apply` in the qualifier.
+          inContext(preErasureCtx) {
+            val qualTp = tree.qualifier.typeOpt.widen
+            if qualTp.derivesFrom(defn.PolyFunctionClass) then
+              erasePolyFunctionApply(qualTp.select(nme.apply).widen).classSymbol
+            else
+              NoSymbol
+          }
         else
           val owner = sym.maybeOwner
           if defn.specialErasure.contains(owner) then
             assert(sym.isConstructor, s"${sym.showLocated}")
             defn.specialErasure(owner)
           else if defn.isSyntheticFunctionClass(owner) then
-            defn.erasedFunctionClass(owner)
+            defn.functionTypeErasure(owner).typeSymbol
           else
             owner
 
@@ -718,7 +698,7 @@ object Erasure {
 
       val owner = mapOwner(origSym)
       val sym = if (owner eq origSym.maybeOwner) origSym else owner.info.decl(tree.name).symbol
-      assert(sym.exists, origSym.showLocated)
+      assert(sym.exists, i"no owner from $owner/${origSym.showLocated} in $tree")
 
       if owner == defn.ObjectClass then checkValue(qual1)
 
@@ -828,49 +808,46 @@ object Erasure {
      */
     override def typedApply(tree: untpd.Apply, pt: Type)(using Context): Tree =
       val Apply(fun, args) = tree
-      if fun.symbol == defn.cbnArg then
-        typedUnadapted(args.head, pt)
-      else
-        val origFun = fun.asInstanceOf[tpd.Tree]
-        val origFunType = origFun.tpe.widen(using preErasureCtx)
-        val ownArgs = if origFunType.isErasedMethod then Nil else args
-        val fun1 = typedExpr(fun, AnyFunctionProto)
-        fun1.tpe.widen match
-          case mt: MethodType =>
-            val (xmt,        // A method type like `mt` but with bunched arguments expanded to individual ones
-                 bunchArgs,  // whether arguments are bunched
-                 outers) =   // the outer reference parameter(s)
-              if fun1.isInstanceOf[Apply] then
-                (mt, fun1.removeAttachment(BunchedArgs).isDefined, Nil)
-              else
-                val xmt = expandedMethodType(mt, origFun)
-                (xmt, xmt ne mt, outer.args(origFun))
+      val origFun = fun.asInstanceOf[tpd.Tree]
+      val origFunType = origFun.tpe.widen(using preErasureCtx)
+      val ownArgs = if origFunType.isErasedMethod then Nil else args
+      val fun1 = typedExpr(fun, AnyFunctionProto)
+      fun1.tpe.widen match
+        case mt: MethodType =>
+          val (xmt,        // A method type like `mt` but with bunched arguments expanded to individual ones
+                bunchArgs,  // whether arguments are bunched
+                outers) =   // the outer reference parameter(s)
+            if fun1.isInstanceOf[Apply] then
+              (mt, fun1.removeAttachment(BunchedArgs).isDefined, Nil)
+            else
+              val xmt = expandedMethodType(mt, origFun)
+              (xmt, xmt ne mt, outer.args(origFun))
 
-            val args0 = outers ::: ownArgs
-            val args1 = args0.zipWithConserve(xmt.paramInfos)(typedExpr)
-              .asInstanceOf[List[Tree]]
+          val args0 = outers ::: ownArgs
+          val args1 = args0.zipWithConserve(xmt.paramInfos)(typedExpr)
+            .asInstanceOf[List[Tree]]
 
-            def mkApply(finalFun: Tree, finalArgs: List[Tree]) =
-              val app = untpd.cpy.Apply(tree)(finalFun, finalArgs)
-                .withType(applyResultType(xmt, args1))
-              if bunchArgs then app.withAttachment(BunchedArgs, ()) else app
+          def mkApply(finalFun: Tree, finalArgs: List[Tree]) =
+            val app = untpd.cpy.Apply(tree)(finalFun, finalArgs)
+              .withType(applyResultType(xmt, args1))
+            if bunchArgs then app.withAttachment(BunchedArgs, ()) else app
 
-            def app(fun1: Tree): Tree = fun1 match
-              case Block(stats, expr) =>
-                cpy.Block(fun1)(stats, app(expr))
-              case Apply(fun2, SeqLiteral(prevArgs, argTpt) :: _) if bunchArgs =>
-                mkApply(fun2, JavaSeqLiteral(prevArgs ++ args1, argTpt) :: Nil)
-              case Apply(fun2, prevArgs) =>
-                mkApply(fun2, prevArgs ++ args1)
-              case _ if bunchArgs =>
-                mkApply(fun1, JavaSeqLiteral(args1, TypeTree(defn.ObjectType)) :: Nil)
-              case _ =>
-                mkApply(fun1, args1)
+          def app(fun1: Tree): Tree = fun1 match
+            case Block(stats, expr) =>
+              cpy.Block(fun1)(stats, app(expr))
+            case Apply(fun2, SeqLiteral(prevArgs, argTpt) :: _) if bunchArgs =>
+              mkApply(fun2, JavaSeqLiteral(prevArgs ++ args1, argTpt) :: Nil)
+            case Apply(fun2, prevArgs) =>
+              mkApply(fun2, prevArgs ++ args1)
+            case _ if bunchArgs =>
+              mkApply(fun1, JavaSeqLiteral(args1, TypeTree(defn.ObjectType)) :: Nil)
+            case _ =>
+              mkApply(fun1, args1)
 
-            app(fun1)
-          case t =>
-            if ownArgs.isEmpty then fun1
-            else throw new MatchError(i"tree $tree has unexpected type of function $fun/$fun1: $t, was $origFunType, args = $ownArgs")
+          app(fun1)
+        case t =>
+          if ownArgs.isEmpty then fun1
+          else throw new MatchError(i"tree $tree has unexpected type of function $fun/$fun1: $t, was $origFunType, args = $ownArgs")
     end typedApply
 
     // The following four methods take as the proto-type the erasure of the pre-existing type,
@@ -960,7 +937,7 @@ object Erasure {
       if constr.isConstructor && needsOuterParam(constr.owner.asClass) then
         constr.info match
           case MethodTpe(outerName :: _, outerType :: _, _) =>
-            val outerSym = newSymbol(constr, outerName, Flags.Param, outerType)
+            val outerSym = newSymbol(constr, outerName, Flags.Param | Flags.SyntheticArtifact, outerType)
             ValDef(outerSym) :: Nil
           case _ =>
             // There's a possible race condition that a constructor was looked at

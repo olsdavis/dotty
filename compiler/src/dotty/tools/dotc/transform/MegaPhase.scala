@@ -296,9 +296,7 @@ class MegaPhase(val miniPhases: Array[MiniPhase]) extends Phase {
         }
       case tree: Block =>
         inContext(prepBlock(tree, start)(using outerCtx)) {
-          val stats = transformStats(tree.stats, ctx.owner, start)
-          val expr = transformTree(tree.expr, start)
-          goBlock(cpy.Block(tree)(stats, expr), start)
+          transformBlock(tree, start)
         }
       case tree: TypeApply =>
         inContext(prepTypeApply(tree, start)(using outerCtx)) {
@@ -432,16 +430,21 @@ class MegaPhase(val miniPhases: Array[MiniPhase]) extends Phase {
   def transformSpecificTree[T <: Tree](tree: T, start: Int)(using Context): T =
     transformTree(tree, start).asInstanceOf[T]
 
-  def transformStats(trees: List[Tree], exprOwner: Symbol, start: Int)(using Context): List[Tree] = {
-    def transformStat(stat: Tree)(using Context): Tree = stat match {
-      case _: Import | _: DefTree => transformTree(stat, start)
-      case Thicket(stats) => cpy.Thicket(stat)(stats.mapConserve(transformStat))
-      case _ => transformTree(stat, start)(using ctx.exprContext(stat, exprOwner))
-    }
+  def transformStats(trees: List[Tree], exprOwner: Symbol, start: Int)(using Context): List[Tree] =
     val nestedCtx = prepStats(trees, start)
-    val trees1 = trees.mapInline(transformStat(_)(using nestedCtx))
+    val trees1 = trees.mapStatements(exprOwner, transformTree(_, start), stats1 => stats1)(using nestedCtx)
     goStats(trees1, start)(using nestedCtx)
-  }
+
+  def transformBlock(tree: Block, start: Int)(using Context): Tree =
+    val nestedCtx = prepStats(tree.stats, start)
+    val block1 = tree.stats.mapStatements(ctx.owner,
+      transformTree(_, start),
+      stats1 => ctx ?=> {
+        val stats2 = goStats(stats1, start)(using nestedCtx)
+        val expr2 = transformTree(tree.expr, start)
+        cpy.Block(tree)(stats2, expr2)
+      })(using nestedCtx)
+    goBlock(block1, start)
 
   def transformUnit(tree: Tree)(using Context): Tree = {
     val nestedCtx = prepUnit(tree, 0)
@@ -460,11 +463,6 @@ class MegaPhase(val miniPhases: Array[MiniPhase]) extends Phase {
       atPhase(miniPhases.last.next)(transformUnit(ctx.compilationUnit.tpdTree))
 
   // Initialization code
-
-  for ((phase, idx) <- miniPhases.zipWithIndex) {
-    phase.superPhase = this
-    phase.idxInGroup = idx
-  }
 
   /** Class#getDeclaredMethods is slow, so we cache its output */
   private val clsMethodsCache = new java.util.IdentityHashMap[Class[?], Array[java.lang.reflect.Method]]
@@ -569,6 +567,11 @@ class MegaPhase(val miniPhases: Array[MiniPhase]) extends Phase {
   private val nxUnitTransPhase = init("transformUnit")
   private val nxOtherPrepPhase = init("prepareForOther")
   private val nxOtherTransPhase = init("transformOther")
+
+  for ((phase, idx) <- miniPhases.zipWithIndex) {
+    phase.superPhase = this
+    phase.idxInGroup = idx
+  }
 
   // Boilerplate snippets
 

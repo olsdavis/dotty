@@ -24,11 +24,13 @@ object OrderingConstraint {
   type ParamOrdering = ArrayValuedMap[List[TypeParamRef]]
 
   /** A new constraint with given maps */
-  private def newConstraint(boundsMap: ParamBounds, lowerMap: ParamOrdering, upperMap: ParamOrdering)(using Context) : OrderingConstraint = {
-    val result = new OrderingConstraint(boundsMap, lowerMap, upperMap)
-    ctx.run.recordConstraintSize(result, result.boundsMap.size)
-    result
-  }
+  private def newConstraint(boundsMap: ParamBounds, lowerMap: ParamOrdering, upperMap: ParamOrdering)(using Context) : OrderingConstraint =
+    if boundsMap.isEmpty && lowerMap.isEmpty && upperMap.isEmpty then
+      empty
+    else
+      val result = new OrderingConstraint(boundsMap, lowerMap, upperMap)
+      ctx.run.recordConstraintSize(result, result.boundsMap.size)
+      result
 
   /** A lens for updating a single entry array in one of the three constraint maps */
   abstract class ConstraintLens[T <: AnyRef: ClassTag] {
@@ -131,6 +133,8 @@ import OrderingConstraint._
 class OrderingConstraint(private val boundsMap: ParamBounds,
                          private val lowerMap : ParamOrdering,
                          private val upperMap : ParamOrdering) extends Constraint {
+
+  import UnificationDirection.*
 
   type This = OrderingConstraint
 
@@ -348,13 +352,40 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
   /** Add the fact `param1 <: param2` to the constraint `current` and propagate
    *  `<:<` relationships between parameters ("edges") but not bounds.
    */
-  private def order(current: This, param1: TypeParamRef, param2: TypeParamRef)(using Context): This =
+  def order(current: This, param1: TypeParamRef, param2: TypeParamRef, direction: UnificationDirection = NoUnification)(using Context): This =
     if (param1 == param2 || current.isLess(param1, param2)) this
     else {
       assert(contains(param1), i"$param1")
       assert(contains(param2), i"$param2")
-      val newUpper = param2 :: exclusiveUpper(param2, param1)
-      val newLower = param1 :: exclusiveLower(param1, param2)
+      val unifying = direction != NoUnification
+      val newUpper = {
+        val up = exclusiveUpper(param2, param1)
+        if unifying then
+          // Since param2 <:< param1 already holds now, filter out param1 to avoid adding
+          //   duplicated orderings.
+          val filtered = up.filterNot(_ eq param1)
+          // Only add bounds for param2 if it will be kept in the constraint after unification.
+          if direction == KeepParam2 then
+            param2 :: filtered
+          else
+            filtered
+        else
+          param2 :: up
+      }
+      val newLower = {
+        val lower = exclusiveLower(param1, param2)
+        if unifying then
+          // Similarly, filter out param2 from lowerly-ordered parameters
+          //   to avoid duplicated orderings.
+          val filtered = lower.filterNot(_ eq param2)
+          // Only add bounds for param1 if it will be kept in the constraint after unification.
+          if direction == KeepParam1 then
+            param1 :: filtered
+          else
+            filtered
+        else
+          param1 :: lower
+      }
       val current1 = newLower.foldLeft(current)(upperLens.map(this, _, _, newUpper ::: _))
       val current2 = newUpper.foldLeft(current1)(lowerLens.map(this, _, _, newLower ::: _))
       current2
@@ -395,14 +426,8 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
   def updateEntry(param: TypeParamRef, tp: Type)(using Context): This =
     updateEntry(this, param, ensureNonCyclic(param, tp)).checkNonCyclic()
 
-  def addLess(param1: TypeParamRef, param2: TypeParamRef)(using Context): This =
-    order(this, param1, param2).checkNonCyclic()
-
-  def unify(p1: TypeParamRef, p2: TypeParamRef)(using Context): This =
-    val bound1 = nonParamBounds(p1).substParam(p2, p1)
-    val bound2 = nonParamBounds(p2).substParam(p2, p1)
-    val p1Bounds = bound1 & bound2
-    updateEntry(p1, p1Bounds).replace(p2, p1)
+  def addLess(param1: TypeParamRef, param2: TypeParamRef, direction: UnificationDirection)(using Context): This =
+    order(this, param1, param2, direction).checkNonCyclic()
 
 // ---------- Replacements and Removals -------------------------------------
 
@@ -456,48 +481,6 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
   }
 
 // ----------- Joins -----------------------------------------------------
-
-  def & (other: Constraint, otherHasErrors: Boolean)(using Context): OrderingConstraint = {
-
-    def merge[T](m1: ArrayValuedMap[T], m2: ArrayValuedMap[T], join: (T, T) => T): ArrayValuedMap[T] = {
-      var merged = m1
-      def mergeArrays(xs1: Array[T], xs2: Array[T]) = {
-        val xs = xs1.clone
-        for (i <- xs.indices) xs(i) = join(xs1(i), xs2(i))
-        xs
-      }
-      m2.foreachBinding { (poly, xs2) =>
-        merged = merged.updated(poly,
-            if (m1.contains(poly)) mergeArrays(m1(poly), xs2) else xs2)
-      }
-      merged
-    }
-
-    def mergeParams(ps1: List[TypeParamRef], ps2: List[TypeParamRef]) =
-      ps2.foldLeft(ps1)((ps1, p2) => if (ps1.contains(p2)) ps1 else p2 :: ps1)
-
-    // Must be symmetric
-    def mergeEntries(e1: Type, e2: Type): Type =
-      (e1, e2) match {
-        case _ if e1 eq e2 => e1
-        case (e1: TypeBounds, e2: TypeBounds) => e1 & e2
-        case (e1: TypeBounds, _) if e1 contains e2 => e2
-        case (_, e2: TypeBounds) if e2 contains e1 => e1
-        case (tv1: TypeVar, tv2: TypeVar) if tv1 eq tv2 => e1
-        case _ =>
-          if (otherHasErrors)
-            e1
-          else
-            throw new AssertionError(i"cannot merge $this with $other, mergeEntries($e1, $e2) failed")
-      }
-
-    val that = other.asInstanceOf[OrderingConstraint]
-
-    new OrderingConstraint(
-        merge(this.boundsMap, that.boundsMap, mergeEntries),
-        merge(this.lowerMap, that.lowerMap, mergeParams),
-        merge(this.upperMap, that.upperMap, mergeParams))
-  }.showing(i"constraint merge $this with $other = $result", constr)
 
   def hasConflictingTypeVarsFor(tl: TypeLambda, that: Constraint): Boolean =
     contains(tl) && that.contains(tl) &&
@@ -641,49 +624,10 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
     upperMap.foreachBinding((_, paramss) => paramss.foreach(_.foreach(checkClosedType(_, "upper"))))
   end checkClosed
 
-// ---------- toText -----------------------------------------------------
-
-  private def contentsToText(printer: Printer): Text =
-    //Printer.debugPrintUnique = true
-    def entryText(tp: Type) = tp match {
-      case tp: TypeBounds =>
-        tp.toText(printer)
-      case _ =>
-        " := " ~ tp.toText(printer)
-    }
-    val indent = 3
-    val uninstVarsText = " uninstantiated variables: " ~
-      Text(uninstVars.map(_.toText(printer)), ", ")
-    val constrainedText =
-      " constrained types: " ~ Text(domainLambdas map (_.toText(printer)), ", ")
-    val boundsText =
-      " bounds: " ~ {
-        val assocs =
-          for (param <- domainParams)
-          yield (" " * indent) ~ param.toText(printer) ~ entryText(entry(param))
-        Text(assocs, "\n")
-      }
-    val orderingText =
-      " ordering: " ~ {
-        val deps =
-          for {
-            param <- domainParams
-            ups = minUpper(param)
-            if ups.nonEmpty
-          }
-          yield
-            (" " * indent) ~ param.toText(printer) ~ " <: " ~
-              Text(ups.map(_.toText(printer)), ", ")
-        Text(deps, "\n")
-      }
-    //Printer.debugPrintUnique = false
-    Text.lines(List(uninstVarsText, constrainedText, boundsText, orderingText))
+// ---------- Printing -----------------------------------------------------
 
   override def toText(printer: Printer): Text =
-    Text.lines(List("Constraint(", contentsToText(printer), ")"))
-
-  def contentsToString(using Context): String =
-    contentsToText(ctx.printer).show
+    printer.toText(this)
 
   override def toString: String = {
     def entryText(tp: Type): String = tp match {
@@ -692,7 +636,7 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
     }
     val constrainedText =
       " constrained types = " + domainLambdas.mkString("\n")
-    val boundsText = domainLambdas
+    val boundsText =
       " bounds = " + {
         val assocs =
           for (param <- domainParams)

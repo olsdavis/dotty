@@ -55,6 +55,8 @@ object Errors {
       case unsafe: UnsafePromotion => unsafe.errors.flatMap(_.flatten)
       case _ => this :: Nil
     }
+
+    override def toString() = this.getClass.getName
   }
 
   /** Access non-initialized field */
@@ -69,7 +71,7 @@ object Errors {
 
   /** Promote `this` under initialization to fully-initialized */
   case class PromoteError(msg: String, source: Tree, trace: Seq[Tree]) extends Error {
-    def show(using Context): String = "Promote the value under initialization to fully-initialized. " + msg + "."
+    def show(using Context): String = "Cannot prove that the value is fully initialized. " + msg + "."
   }
 
   case class AccessCold(field: Symbol, source: Tree, trace: Seq[Tree]) extends Error {
@@ -96,7 +98,7 @@ object Errors {
 
     def show(using Context): String = {
       var index = 0
-      "Cannot prove that the value is fully-initialized. " + msg + ".\n" + stacktrace +
+      "Cannot prove that the value is fully initialized. " + msg + ".\n" + stacktrace +
         "\nThe unsafe promotion may cause the following problem:\n" +
         errors.head.show + errors.head.stacktrace
     }

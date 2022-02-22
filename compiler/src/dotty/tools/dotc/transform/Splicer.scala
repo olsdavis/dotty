@@ -49,7 +49,7 @@ object Splicer {
           val oldContextClassLoader = Thread.currentThread().getContextClassLoader
           Thread.currentThread().setContextClassLoader(classLoader)
           try {
-            val interpreter = new Interpreter(spliceExpansionPos, classLoader)
+            val interpreter = new Interpreter(splicePos, classLoader)
 
             // Some parts of the macro are evaluated during the unpickling performed in quotedExprToTree
             val interpretedExpr = interpreter.interpret[Quotes => scala.quoted.Expr[Any]](tree)
@@ -149,7 +149,14 @@ object Splicer {
         case Typed(expr, _) => checkIfValidArgument(expr)
 
         case Apply(Select(Apply(fn, quoted :: Nil), nme.apply), _) if fn.symbol == defn.QuotedRuntime_exprQuote =>
-          // OK
+          val noSpliceChecker = new TreeTraverser {
+            def traverse(tree: Tree)(using Context): Unit = tree match
+              case Spliced(_) =>
+                report.error("Quoted argument of macros may not have splices", tree.srcPos)
+              case _ =>
+                traverseChildren(tree)
+          }
+          noSpliceChecker.traverse(quoted)
 
         case Apply(TypeApply(fn, List(quoted)), _)if fn.symbol == defn.QuotedTypeModule_of =>
           // OK
@@ -350,12 +357,18 @@ object Splicer {
 
     private def interpretedStaticMethodCall(moduleClass: Symbol, fn: Symbol)(implicit env: Env): List[Object] => Object = {
       val (inst, clazz) =
-        if (moduleClass.name.startsWith(str.REPL_SESSION_LINE))
-          (null, loadReplLineClass(moduleClass))
-        else {
-          val inst = loadModule(moduleClass)
-          (inst, inst.getClass)
-        }
+        try
+          if (moduleClass.name.startsWith(str.REPL_SESSION_LINE))
+            (null, loadReplLineClass(moduleClass))
+          else {
+            val inst = loadModule(moduleClass)
+            (inst, inst.getClass)
+          }
+        catch
+          case MissingClassDefinedInCurrentRun(sym)  if ctx.compilationUnit.isSuspendable =>
+            if (ctx.settings.XprintSuspension.value)
+              report.echo(i"suspension triggered by a dependency on $sym", pos)
+            ctx.compilationUnit.suspend() // this throws a SuspendException
 
       val name = fn.name.asTermName
       val method = getMethod(clazz, name, paramsSig(fn))
@@ -416,6 +429,10 @@ object Splicer {
         case _: NoSuchMethodException =>
           val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
           throw new StopInterpretation(msg, pos)
+        case MissingClassDefinedInCurrentRun(sym) if ctx.compilationUnit.isSuspendable =>
+            if (ctx.settings.XprintSuspension.value)
+              report.echo(i"suspension triggered by a dependency on $sym", pos)
+            ctx.compilationUnit.suspend() // this throws a SuspendException
       }
 
     private def stopIfRuntimeException[T](thunk: => T, method: JLRMethod): T =

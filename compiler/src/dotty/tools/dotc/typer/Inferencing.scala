@@ -7,7 +7,7 @@ import ast._
 import Contexts._, Types._, Flags._, Symbols._
 import Trees._
 import ProtoTypes._
-import NameKinds.UniqueName
+import NameKinds.{AvoidNameKind, UniqueName}
 import util.Spans._
 import util.{Stats, SimpleIdentityMap}
 import Decorators._
@@ -96,8 +96,12 @@ object Inferencing {
    *  their instantiation could uncover new type members. However that search is best
    *  effort only. It might miss type variables that appear in structures involving
    *  alias types and type projections.
+   *  @param applied  Test is done in a `tryInsertImplicitOnQualifier` application.
+   *                  In this case, we always try to instantiate TypeVars in type arguments.
+   *                  If `applied` is false, we only try that in arguments that may affect
+   *                  the result type.
    */
-  def couldInstantiateTypeVar(tp: Type)(using Context): Boolean = tp.dealias match
+  def couldInstantiateTypeVar(tp: Type, applied: Boolean = false)(using Context): Boolean = tp.dealias match
     case tvar: TypeVar
     if !tvar.isInstantiated
        && ctx.typerState.constraint.contains(tvar)
@@ -120,14 +124,14 @@ object Inferencing {
                 case _ => Nil
             case _ => Nil
         case _ => Nil
-      couldInstantiateTypeVar(tycon)
-      || argsInResult.exists(couldInstantiateTypeVar)
+      couldInstantiateTypeVar(tycon, applied)
+      || (if applied then args else argsInResult).exists(couldInstantiateTypeVar(_, applied))
     case RefinedType(parent, _, _) =>
-      couldInstantiateTypeVar(parent)
+      couldInstantiateTypeVar(parent, applied)
     case tp: AndOrType =>
-      couldInstantiateTypeVar(tp.tp1) || couldInstantiateTypeVar(tp.tp2)
+      couldInstantiateTypeVar(tp.tp1, applied) || couldInstantiateTypeVar(tp.tp2, applied)
     case AnnotatedType(tp, _) =>
-      couldInstantiateTypeVar(tp)
+      couldInstantiateTypeVar(tp, applied)
     case _ =>
       false
 
@@ -179,9 +183,9 @@ object Inferencing {
         && {
           val direction = instDirection(tvar.origin)
           if minimizeSelected then
-            if direction <= 0 && tvar.hasNonWildcardLowerBound then
+            if direction <= 0 && tvar.hasLowerBound then
               instantiate(tvar, fromBelow = true)
-            else if direction >= 0 && tvar.hasNonWildcardUpperBound then
+            else if direction >= 0 && tvar.hasUpperBound then
               instantiate(tvar, fromBelow = false)
             // else hold off instantiating unbounded unconstrained variable
           else if direction != 0 then
@@ -433,11 +437,18 @@ object Inferencing {
 
   type VarianceMap = SimpleIdentityMap[TypeVar, Integer]
 
-  /** All occurrences of type vars in this type that satisfy predicate
-   *  `include` mapped to their variances (-1/0/1) in this type, where
+  /** All occurrences of type vars in `tp` that satisfy predicate
+   *  `include` mapped to their variances (-1/0/1) in both `tp` and
+   *  `pt.finalResultType`, where
    *  -1 means: only contravariant occurrences
    *  +1 means: only covariant occurrences
    *  0 means: mixed or non-variant occurrences
+   *
+   *  We need to take the occurences in `pt` into account because a type
+   *  variable created when typing the current tree might only appear in the
+   *  bounds of a type variable in the expected type, for example when
+   *  `ConstraintHandling#legalBound` creates type variables when approximating
+   *  a bound.
    *
    *  Note: We intentionally use a relaxed version of variance here,
    *  where the variance does not change under a prefix of a named type
@@ -449,7 +460,7 @@ object Inferencing {
    *
    *  we want to instantiate U to x.type right away. No need to wait further.
    */
-  private def variances(tp: Type)(using Context): VarianceMap = {
+  private def variances(tp: Type, pt: Type = WildcardType)(using Context): VarianceMap = {
     Stats.record("variances")
     val constraint = ctx.typerState.constraint
 
@@ -482,21 +493,29 @@ object Inferencing {
       def traverse(tp: Type) = { vmap1 = accu(vmap1, tp) }
       vmap.foreachBinding { (tvar, v) =>
         val param = tvar.origin
-        val e = constraint.entry(param)
-        accu.setVariance(v)
-        if (v >= 0) {
-          traverse(e.bounds.lo)
-          constraint.lower(param).foreach(p => traverse(constraint.typeVarOfParam(p)))
-        }
-        if (v <= 0) {
-          traverse(e.bounds.hi)
-          constraint.upper(param).foreach(p => traverse(constraint.typeVarOfParam(p)))
-        }
+        constraint.entry(param) match
+          case TypeBounds(lo, hi) =>
+            accu.setVariance(v)
+            if v >= 0 then
+              traverse(lo)
+              constraint.lower(param).foreach(p => traverse(constraint.typeVarOfParam(p)))
+            if v <= 0 then
+              traverse(hi)
+              constraint.upper(param).foreach(p => traverse(constraint.typeVarOfParam(p)))
+          case _ =>
       }
       if (vmap1 eq vmap) vmap else propagate(vmap1)
     }
 
-    propagate(accu(SimpleIdentityMap.empty, tp))
+    propagate(accu(accu(SimpleIdentityMap.empty, tp), pt.finalResultType))
+  }
+
+  /** Run the transformation after dealiasing but return the original type if it was a no-op. */
+  private def derivedOnDealias(tp: Type)(transform: Type => Type)(using Context) = {
+    val dealiased = tp.dealias
+    val transformed = transform(dealiased)
+    if transformed eq dealiased then tp // return the original type, not the result of dealiasing
+    else transformed
   }
 
   /** Replace every top-level occurrence of a wildcard type argument by
@@ -504,23 +523,17 @@ object Inferencing {
     *  $i is a skolem of type `scala.internal.TypeBox`, and `CAP` is its
     *  type member. See the documentation of `TypeBox` for a rationale why we do this.
     */
-  def captureWildcards(tp: Type)(using Context): Type = tp match {
+  def captureWildcards(tp: Type)(using Context): Type = derivedOnDealias(tp) {
     case tp @ AppliedType(tycon, args) if tp.hasWildcardArg =>
-      tycon.typeParams match {
-        case tparams @ ((_: Symbol) :: _) =>
-          val boundss = tparams.map(_.paramInfo.substApprox(tparams.asInstanceOf[List[TypeSymbol]], args))
-          val args1 = args.zipWithConserve(boundss) { (arg, bounds) =>
-            arg match {
-              case TypeBounds(lo, hi) =>
-                val skolem = SkolemType(defn.TypeBoxClass.typeRef.appliedTo(lo | bounds.loBound, hi & bounds.hiBound))
-                TypeRef(skolem, defn.TypeBox_CAP)
-              case arg => arg
-            }
-          }
-          tp.derivedAppliedType(tycon, args1)
-        case _ =>
-          tp
+      val tparams = tycon.typeParamSymbols
+      val args1 = args.zipWithConserve(tparams.map(_.paramInfo.substApprox(tparams, args))) {
+        case (TypeBounds(lo, hi), bounds) =>
+          val skolem = SkolemType(defn.TypeBoxClass.typeRef.appliedTo(lo | bounds.loBound, hi & bounds.hiBound))
+          TypeRef(skolem, defn.TypeBox_CAP)
+        case (arg, _) =>
+          arg
       }
+      if tparams.isEmpty then tp else tp.derivedAppliedType(tycon, args1)
     case tp: AndOrType => tp.derivedAndOrType(captureWildcards(tp.tp1), captureWildcards(tp.tp2))
     case tp: RefinedType => tp.derivedRefinedType(captureWildcards(tp.parent), tp.refinedName, tp.refinedInfo)
     case tp: RecType => tp.derivedRecType(captureWildcards(tp.parent))
@@ -540,8 +553,9 @@ trait Inferencing { this: Typer =>
    *  @param locked  the set of type variables of the current typer state that cannot be interpolated
    *                 at the present time
    *  Eligible for interpolation are all type variables owned by the current typerstate
-   *  that are not in locked. Type variables occurring co- (respectively, contra-) variantly in the type
-   *  are minimized (respectvely, maximized). Non occurring type variables are minimized if they
+   *  that are not in `locked` and whose `nestingLevel` is `>= ctx.nestingLevel`.
+   *  Type variables occurring co- (respectively, contra-) variantly in the tree type
+   *  or expected type are minimized (respectvely, maximized). Non occurring type variables are minimized if they
    *  have a lower bound different from Nothing, maximized otherwise. Type variables appearing
    *  non-variantly in the type are left untouched.
    *
@@ -566,7 +580,7 @@ trait Inferencing { this: Typer =>
     if ((ownedVars ne locked) && !ownedVars.isEmpty) {
       val qualifying = ownedVars -- locked
       if (!qualifying.isEmpty) {
-        typr.println(i"interpolate $tree: ${tree.tpe.widen} in $state, owned vars = ${state.ownedVars.toList}%, %, qualifying = ${qualifying.toList}%, %, previous = ${locked.toList}%, % / ${state.constraint}")
+        typr.println(i"interpolate $tree: ${tree.tpe.widen} in $state, pt = $pt, owned vars = ${state.ownedVars.toList}%, %, qualifying = ${qualifying.toList}%, %, previous = ${locked.toList}%, % / ${state.constraint}")
         val resultAlreadyConstrained =
           tree.isInstanceOf[Apply] || tree.tpe.isInstanceOf[MethodOrPoly]
         if (!resultAlreadyConstrained)
@@ -574,7 +588,7 @@ trait Inferencing { this: Typer =>
             // This is needed because it could establish singleton type upper bounds. See i2998.scala.
 
         val tp = tree.tpe.widen
-        val vs = variances(tp)
+        val vs = variances(tp, pt)
 
         // Avoid interpolating variables occurring in tree's type if typerstate has unreported errors.
         // Reason: The errors might reflect unsatisfiable constraints. In that
@@ -601,24 +615,38 @@ trait Inferencing { this: Typer =>
         def constraint = state.constraint
         type InstantiateQueue = mutable.ListBuffer[(TypeVar, Boolean)]
         val toInstantiate = new InstantiateQueue
-        for (tvar <- qualifying)
-          if (!tvar.isInstantiated && constraint.contains(tvar)) {
+        for tvar <- qualifying do
+          if !tvar.isInstantiated && constraint.contains(tvar) && tvar.nestingLevel >= ctx.nestingLevel then
             constrainIfDependentParamRef(tvar, tree)
-
             // Needs to be checked again, since previous interpolations could already have
             // instantiated `tvar` through unification.
             val v = vs(tvar)
-            if (v == null) {
-              typr.println(i"interpolate non-occurring $tvar in $state in $tree: $tp, fromBelow = ${tvar.hasLowerBound}, $constraint")
-              toInstantiate += ((tvar, tvar.hasLowerBound))
-            }
+            if v == null then
+              // Even though `tvar` is non-occurring in `v`, the specific
+              // instantiation we pick still matters because `tvar` might appear
+              // in the bounds of a non-`qualifying` type variable in the
+              // constraint.
+              // In particular, if `tvar` was created as the upper or lower
+              // bound of an existing variable by `LevelAvoidMap`, we
+              // instantiate it in the direction corresponding to the
+              // original variable which might be further constrained later.
+              // Otherwise, we simply rely on `hasLowerBound`.
+              val name = tvar.origin.paramName
+              val fromBelow =
+                name.is(AvoidNameKind.UpperBound) ||
+                !name.is(AvoidNameKind.LowerBound) && tvar.hasLowerBound
+              typr.println(i"interpolate non-occurring $tvar in $state in $tree: $tp, fromBelow = $fromBelow, $constraint")
+              toInstantiate += ((tvar, fromBelow))
+            else if v.intValue != 0 then
+              typr.println(i"interpolate $tvar in $state in $tree: $tp, fromBelow = ${v.intValue == 1}, $constraint")
+              toInstantiate += ((tvar, v.intValue == 1))
+            else if tvar.nestingLevel > ctx.nestingLevel then
+              // Invariant: a type variable of level N can only appear
+              // in the type of a tree whose enclosing scope is level <= N.
+              typr.println(i"instantiate nonvariant $tvar of level ${tvar.nestingLevel} to a type variable of level <= ${ctx.nestingLevel}, $constraint")
+              comparing(_.atLevel(ctx.nestingLevel, tvar.origin))
             else
-              if (v.intValue != 0) {
-                typr.println(i"interpolate $tvar in $state in $tree: $tp, fromBelow = ${v.intValue == 1}, $constraint")
-                toInstantiate += ((tvar, v.intValue == 1))
-              }
-              else typr.println(i"no interpolation for nonvariant $tvar in $state")
-          }
+              typr.println(i"no interpolation for nonvariant $tvar in $state")
 
         /** Instantiate all type variables in `buf` in the indicated directions.
          *  If a type variable A is instantiated from below, and there is another
@@ -678,26 +706,26 @@ trait Inferencing { this: Typer =>
    *  type if necessary to make it a Singleton.
    */
   private def constrainIfDependentParamRef(tvar: TypeVar, call: Tree)(using Context): Unit =
-    representedParamRef(tvar) match
-      case ref: TermParamRef =>
+    if tvar.origin.paramName.is(NameKinds.DepParamName) then
+      representedParamRef(tvar.origin) match
+        case ref: TermParamRef =>
+          def findArg(tree: Tree)(using Context): Tree = tree match
+            case Apply(fn, args) =>
+              if fn.tpe.widen eq ref.binder then
+                if ref.paramNum < args.length then args(ref.paramNum)
+                else EmptyTree
+              else findArg(fn)
+            case TypeApply(fn, _) => findArg(fn)
+            case Block(_, expr) => findArg(expr)
+            case Inlined(_, _, expr) => findArg(expr)
+            case _ => EmptyTree
 
-        def findArg(tree: Tree)(using Context): Tree = tree match
-          case Apply(fn, args) =>
-            if fn.tpe.widen eq ref.binder then
-              if ref.paramNum < args.length then args(ref.paramNum)
-              else EmptyTree
-            else findArg(fn)
-          case TypeApply(fn, _) => findArg(fn)
-          case Block(_, expr) => findArg(expr)
-          case Inlined(_, _, expr) => findArg(expr)
-          case _ => EmptyTree
-
-        val arg = findArg(call)
-        if !arg.isEmpty then
-          var argType = arg.tpe.widenExpr.widenTermRefExpr
-          if !argType.isSingleton then argType = SkolemType(argType)
-          argType <:< tvar
-      case _ =>
+          val arg = findArg(call)
+          if !arg.isEmpty then
+            var argType = arg.tpe.widenIfUnstable
+            if !argType.isSingleton then argType = SkolemType(argType)
+            argType <:< tvar
+        case _ =>
   end constrainIfDependentParamRef
 }
 

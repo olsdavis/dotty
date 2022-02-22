@@ -13,134 +13,48 @@ import java.nio.file.Path
 import java.nio.file.Files
 import java.nio.file.FileVisitOption
 import java.io.File
+import dotty.tools.scaladoc.staticFileSymbolUUID
 
-case class Page(link: Link, content: Member | ResolvedTemplate | String, children: Seq[Page]):
-  def withNewChildren(newChildren: Seq[Page]) = copy(children = children ++ newChildren)
+class HtmlRenderer(rootPackage: Member, members: Map[DRI, Member])(using ctx: DocContext)
+  extends Renderer(rootPackage, members, extension = "html"):
 
-  def withTitle(newTitle: String) = copy(link = link.copy(name = newTitle))
-
-  def hasFrame = content match
-    case t: ResolvedTemplate => t.hasFrame
-    case _ => true
-
-class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx: DocContext)
-  extends SiteRenderer, Resources, Locations, Writer:
-  private val args = summon[DocContext].args
-  val staticSite = summon[DocContext].staticSiteContext
-
-  val effectiveMembers = members
-
-  private def memberPage(member: Member): Page =
-    val childrenPages = member.members.filter(_.needsOwnPage)
-    Page(Link(member.name, member.dri), member, childrenPages.map(memberPage))
-
-  val navigablePage: Page =
-    val rootPckPage = memberPage(rootPackage)
-    staticSite match
-      case None => rootPckPage.withTitle(args.name)
-      case Some(siteContext) =>
-        val (indexes, templates) = siteContext.templates.partition(f =>
-          f.templateFile.isIndexPage() && f.file.toPath.getParent() == siteContext.docsPath)
-        if (indexes.size > 1)
-          val msg = s"ERROR: Multiple index pages for doc found ${indexes.map(_.file)}"
-          report.error(msg)
-
-        val templatePages = templates.map(templateToPage(_, siteContext))
-
-        indexes.headOption match
-          case None if templatePages.isEmpty=>
-            rootPckPage.withTitle(args.name)
-          case None =>
-            Page(Link(args.name, docsRootDRI),"", templatePages :+ rootPckPage.withTitle("API"))
-          case Some(indexPage) =>
-            val newChildren = templatePages :+ rootPckPage.withTitle("API")
-            templateToPage(indexPage, siteContext).withNewChildren(newChildren)
-
-  val hiddenPages: Seq[Page] =
-    staticSite match
-      case None =>
-        Seq(navigablePage.copy( // Add index page that is a copy of api/index.html
-          link = navigablePage.link.copy(dri = docsRootDRI),
-          children = Nil
-        ))
-      case Some(siteContext) =>
-        (siteContext.orphanedTemplates :+ siteContext.indexTemplate()).map(templateToPage(_, siteContext))
-
-  /**
-   * Here we have to retrive index pages from hidden pages and replace fake index pages in navigable page tree.
-   */
-  private def getAllPages: Seq[Page] =
-
-    def traversePages(page: Page): (Page, Seq[Page]) =
-      val (newChildren, newPagesToRemove): (Seq[Page], Seq[Page]) = page.children.map(traversePages(_)).foldLeft((Seq[Page](), Seq[Page]())) {
-        case ((pAcc, ptrAcc), (p, ptr)) => (pAcc :+ p, ptrAcc ++ ptr)
-      }
-      hiddenPages.find(_.link == page.link) match
-        case None =>
-          (page.copy(children = newChildren), newPagesToRemove)
-        case Some(newPage) =>
-          (newPage.copy(children = newChildren), newPagesToRemove :+ newPage)
-
-    val (newNavigablePage, pagesToRemove) = traversePages(navigablePage)
-
-    newNavigablePage +: hiddenPages.filterNot(pagesToRemove.contains)
-
-  val allPages = getAllPages
-
-  def renderContent(page: Page) = page.content match
-    case m: Member =>
-      val signatureRenderer = new SignatureRenderer:
-        def currentDri: DRI = page.link.dri
-        def link(dri: DRI): Option[String] =
-          Some(pathToPage(currentDri, dri)).filter(_ != UnresolvedLocationLink)
-
-      MemberRenderer(signatureRenderer).fullMember(m)
-    case t: ResolvedTemplate => siteContent(page.link.dri, t)
-    case a: String =>  raw(a)
-
-
-  def renderPage(page: Page, parents: Vector[Link]): Seq[String] =
-    val newParents = parents :+ page.link
-    val content = html(
+  override def pageContent(page: Page, parents: Vector[Link]): AppliedTag =
+    html(
       mkHead(page),
       body(
         if !page.hasFrame then renderContent(page)
-        else mkFrame(page.link, newParents, renderContent(page))
+        else mkFrame(page.link, parents, renderContent(page))
       )
     )
-    write(page.link.dri, content) +: page.children.flatMap(renderPage(_, newParents))
 
-  private def specificResources(page: Page): Set[String] =
-    page.children.toSet.flatMap(specificResources) ++ (page.content match
-      case r: ResolvedTemplate =>
-        r.resolved.resources.toSet
-      case _ => Set.empty
-    )
+  override def render(): Unit =
+    val renderedResources = renderResources()
+    super.render()
 
   private def renderResources(): Seq[String] =
-    def siteRoot = staticSite.get.root.toPath
-    def pathToResource(p: String) = Resource.File(p, siteRoot.resolve(p))
-
-    def harvestResources(path: String) =
-      val siteImgPath = siteRoot.resolve(path)
-      if !Files.exists(siteImgPath) then Nil
-      else
-        val allPaths = Files.walk(siteImgPath, FileVisitOption.FOLLOW_LINKS)
-        val files = allPaths.filter(Files.isRegularFile(_)).iterator().asScala
-        files.map(p => siteRoot.relativize(p).toString).toList
-
-    val staticResources = staticSite.toSeq.flatMap { _ =>
-      harvestResources("images") ++ harvestResources("resources")
-    }
-
-    val siteResourcesPaths = allPages.toSet.flatMap(specificResources) ++ staticResources
-
-    val resources = siteResourcesPaths.toSeq.map(pathToResource) ++ allResources(allPages)
+    import scala.util.Using
+    import scala.jdk.CollectionConverters._
+    // All static site resources need to be in _assets folder
+    val staticSiteResources = staticSite
+      .map(_.root.toPath.resolve("_assets").toFile)
+      .filter(f => f.exists && f.isDirectory)
+      .toSeq
+      .flatMap { resourceFile =>
+        resourceFile.listFiles.toSeq.map(_.toPath).flatMap { file =>
+          Using(Files.walk(file)) { stream =>
+            stream.iterator().asScala.toSeq
+              .map(from => Resource.File(resourceFile.toPath.relativize(from).toString, from))
+          }.fold (
+            { t =>
+              report.warn(s"Error occured while processing _assets file.", t)
+              Seq.empty
+            },
+            identity
+          )
+        }
+      }
+    val resources = staticSiteResources ++ allResources(allPages) ++ onlyRenderedResources
     resources.flatMap(renderResource)
-
-  def render(): Unit =
-    val renderedResources = renderResources()
-    val sites = allPages.map(renderPage(_, Vector.empty))
 
   def mkHead(page: Page): AppliedTag =
     val resources = page.content match
@@ -166,6 +80,20 @@ class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx
       linkResources(page.link.dri, earlyResources, deferJs = false).toList,
       linkResources(page.link.dri, resources, deferJs = true).toList,
       script(raw(s"""var pathToRoot = "${pathToRoot(page.link.dri)}";""")),
+      (page.content match
+        case ResolvedTemplate(loadedTemplate, _) =>
+          val path = loadedTemplate.templateFile.file.toPath
+          ctx.sourceLinks.repoSummary(path) match
+            case Some(DefinedRepoSummary("github", org, repo)) =>
+              val tag: TagArg = ctx.sourceLinks.fullPath(relativePath(path)).fold("") { githubContributors =>
+                Seq(
+                  script(raw(s"""var githubContributorsUrl = "https://api.github.com/repos/$org/$repo";""")),
+                  script(raw(s"""var githubContributorsFilename = "$githubContributors";"""))
+                )
+              }
+              tag // for some reason inference fails so had to state the type explicitly
+            case _ => ""
+        case _ => ""),
       ctx.args.versionsDictionaryUrl match
         case Some(url) => script(raw(s"""var versionsDictionaryUrl = "$url";"""))
         case None => ""
@@ -179,7 +107,8 @@ class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx
 
     def renderNested(nav: Page, toplevel: Boolean = false): (Boolean, AppliedTag) =
       val isSelected = nav.link.dri == pageLink.dri
-      def linkHtml(expanded: Boolean = false) =
+
+      def linkHtml(expanded: Boolean = false, withArrow: Boolean = false) =
         val attrs: Seq[String] = Seq(
           Option.when(isSelected)("selected"),
           Option.when(expanded)("expanded")
@@ -188,30 +117,26 @@ class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx
           case m: Member => navigationIcon(m)
           case _ => Nil
         }
-        Seq(a(href := pathToPage(pageLink.dri, nav.link.dri), cls := attrs.mkString(" "))(icon, span(nav.link.name)))
+        Seq(
+          span(cls := "nh " + attrs.mkString(" "))(
+            if withArrow then Seq(span(cls := "ar")) else Nil,
+            a(href := pathToPage(pageLink.dri, nav.link.dri))(icon, span(nav.link.name))
+          )
+        )
 
-      nav.children match
-        case Nil => isSelected -> div(linkHtml())
+      nav.children.filterNot(_.hidden) match
+        case Nil => isSelected -> div(cls := s"ni ${if isSelected then "expanded" else ""}")(linkHtml())
         case children =>
           val nested = children.map(renderNested(_))
-          val expanded = nested.exists(_._1) || nav.link == pageLink
+          val expanded = nested.exists(_._1) || isSelected
           val attr =
-            if expanded || isSelected || toplevel then Seq(cls := "expanded") else Nil
+            if expanded || isSelected || toplevel then Seq(cls := "ni expanded") else Seq(cls := "ni")
           (isSelected || expanded) -> div(attr)(
-            linkHtml(expanded),
-            if toplevel then Nil else span(cls := "ar"),
+            linkHtml(expanded, true),
             nested.map(_._2)
           )
 
     renderNested(navigablePage, toplevel = true)._2
-
-  private def canonicalUrl(l: String): AppliedTag | String =
-    val canon = args.docCanonicalBaseUrl
-    if !canon.isEmpty then
-      val canonicalUrl = if canon.endsWith("/") then canon else canon + "/"
-      link(rel := "canonical", href := canonicalUrl + l)
-    else
-      "" // return empty tag
 
   private def hasSocialLinks = !args.socialLinks.isEmpty
 
@@ -235,7 +160,7 @@ class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx
           a(href := pathToPage(link.dri, b.dri))(b.name),
           "/"
         )).dropRight(1)
-      div(cls := "breadcrumbs")(innerTags:_*)
+      div(cls := "breadcrumbs container")(innerTags:_*)
 
     def textFooter: String | AppliedTag =
       args.projectFooter.fold("") { f =>
@@ -254,10 +179,10 @@ class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx
           div(id := "version")(
             div(cls := "versions-dropdown")(
               div(onclick := "dropdownHandler()", id := "dropdown-button", cls := "dropdownbtn dropdownbtnactive")(
-                args.projectVersion.map(v => div(cls:="projectVersion")(v)).getOrElse("")
-              ),
-              div(id := "dropdown-content", cls := "dropdown-content")(
-                input(`type` := "text", placeholder := "Search...", id := "dropdown-input", onkeyup := "filterFunction()"),
+                args.projectVersion.map(v => div(cls:="projectVersion")(v)).getOrElse(""),
+                div(id := "dropdown-content", cls := "dropdown-content")(
+                  input(`type` := "text", placeholder := "Search...", id := "dropdown-input", onkeyup := "filterFunction()"),
+                ),
               ),
             )
           ),
@@ -275,11 +200,9 @@ class HtmlRenderer(rootPackage: Member, val members: Map[DRI, Member])(using ctx
           span(cls := "icon-toggler")
         ),
         div(id := "scaladoc-searchBar"),
-        main(
-          div(id := "content")(
-            parentsHtml,
-            div(content),
-          )
+        main(id := "main-content")(
+          parentsHtml,
+          div(id := "content")(content),
         ),
         footer(
           div(id := "generated-by")(

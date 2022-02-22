@@ -21,7 +21,7 @@ import typer.ProtoTypes._
 import Trees._
 import TypeApplications._
 import Decorators._
-import NameKinds.WildcardParamName
+import NameKinds.{WildcardParamName, DefaultGetterName}
 import util.Chars.isOperatorPart
 import transform.TypeUtils._
 import transform.SymUtils._
@@ -147,7 +147,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       changePrec(GlobalPrec) {
         val argStr: Text =
           if args.length == 2
-             && !defn.isTupleType(args.head)
+             && !defn.isTupleNType(args.head)
              && !isGiven && !isErased
           then
             atPrec(InfixPrec) { argText(args.head) }
@@ -607,7 +607,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       case tree: Template =>
         toTextTemplate(tree)
       case Annotated(arg, annot) =>
-        toTextLocal(arg) ~~ annotText(annot)
+        toTextLocal(arg) ~~ annotText(annot.symbol.enclosingClass, annot)
       case EmptyTree =>
         "<empty>"
       case TypedSplice(t) =>
@@ -699,6 +699,10 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         "Thicket {" ~~ toTextGlobal(trees, "\n") ~~ "}"
       case MacroTree(call) =>
         keywordStr("macro ") ~ toTextGlobal(call)
+      case Hole(isTermHole, idx, args) =>
+        val (prefix, postfix) = if isTermHole then ("{{{ ", " }}}") else ("[[[ ", " ]]]")
+        val argsText = toTextGlobal(args, ", ")
+        prefix ~~ idx.toString ~~ "|" ~~ argsText ~~ postfix
       case _ =>
         tree.fallbackToText(this)
     }
@@ -794,7 +798,15 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
   protected def optAscription[T >: Untyped](tpt: Tree[T]): Text = optText(tpt)(": " ~ _)
 
   private def idText(tree: untpd.Tree): Text =
-    if showUniqueIds && tree.hasType && tree.symbol.exists then s"#${tree.symbol.id}" else ""
+    (if showUniqueIds && tree.hasType && tree.symbol.exists then s"#${tree.symbol.id}" else "") ~
+    (if showNestingLevel then tree.typeOpt match
+      case tp: NamedType if !tp.symbol.isStatic => s"%${tp.symbol.nestingLevel}"
+      case tp: TypeVar => s"%${tp.nestingLevel}"
+      case tp: TypeParamRef => ctx.typerState.constraint.typeVarOfParam(tp) match
+        case tvar: TypeVar => s"%${tvar.nestingLevel}"
+        case _ => ""
+      case _ => ""
+     else "")
 
   private def useSymbol(tree: untpd.Tree) =
     tree.hasType && tree.symbol.exists && ctx.settings.YprintSyms.value
@@ -960,14 +972,22 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     keywordStr("package ") ~ toTextPackageId(tree.pid) ~ bodyText
   }
 
+  /** Textual representation of an instance creation expression without the leading `new` */
   protected def constrText(tree: untpd.Tree): Text = toTextLocal(tree).stripPrefix(keywordStr("new ")) // DD
 
-  protected def annotText(tree: untpd.Tree): Text = "@" ~ constrText(tree) // DD
-
-  override def annotsText(sym: Symbol): Text =
-    Text(sym.annotations.map(ann =>
-      if ann.symbol == defn.BodyAnnot then Str(simpleNameString(ann.symbol))
-      else annotText(ann.tree)))
+  protected def annotText(sym: Symbol, tree: untpd.Tree): Text =
+    def recur(t: untpd.Tree): Text = t match
+      case Apply(fn, Nil) => recur(fn)
+      case Apply(fn, args) =>
+        val explicitArgs = args.filterNot(_.symbol.name.is(DefaultGetterName))
+        recur(fn) ~ "(" ~ toTextGlobal(explicitArgs, ", ") ~ ")"
+      case TypeApply(fn, args) => recur(fn) ~ "[" ~ toTextGlobal(args, ", ") ~ "]"
+      case Select(qual, nme.CONSTRUCTOR) => recur(qual)
+      case New(tpt) => recur(tpt)
+      case _ =>
+        val annotSym = sym.orElse(tree.symbol.enclosingClass)
+        s"@${if annotSym.exists then annotSym.name.toString else t.show}"
+    recur(tree)
 
   protected def modText(mods: untpd.Modifiers, sym: Symbol, kw: String, isType: Boolean): Text = { // DD
     val suppressKw = if (enclDefIsClass) mods.isAllOf(LocalParam) else mods.is(Param)
@@ -980,11 +1000,15 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     if (rawFlags.is(Param)) flagMask = flagMask &~ Given &~ Erased
     val flags = rawFlags & flagMask
     var flagsText = toTextFlags(sym, flags)
-    val annotations =
-      if (sym.exists) sym.annotations.filterNot(ann => dropAnnotForModText(ann.symbol)).map(_.tree)
-      else mods.annotations.filterNot(tree => dropAnnotForModText(tree.symbol))
-    Text(annotations.map(annotText), " ") ~~ flagsText ~~ (Str(kw) provided !suppressKw)
+    val annotTexts =
+      if sym.exists then
+        sym.annotations.filterNot(ann => dropAnnotForModText(ann.symbol)).map(toText)
+      else
+        mods.annotations.filterNot(tree => dropAnnotForModText(tree.symbol)).map(annotText(NoSymbol, _))
+    Text(annotTexts, " ") ~~ flagsText ~~ (Str(kw) provided !suppressKw)
   }
+
+  override def annotText(annot: Annotation): Text = annotText(annot.symbol, annot.tree)
 
   def optText(name: Name)(encl: Text => Text): Text =
     if (name.isEmpty) "" else encl(toText(name))

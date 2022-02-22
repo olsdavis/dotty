@@ -46,7 +46,7 @@ object Symbols {
    *  @param coord  The coordinates of the symbol (a position or an index)
    *  @param id     A unique identifier of the symbol (unique per ContextBase)
    */
-  class Symbol private[Symbols] (private var myCoord: Coord, val id: Int)
+  class Symbol private[Symbols] (private var myCoord: Coord, val id: Int, val nestingLevel: Int)
     extends Designator, ParamInfo, SrcPos, printing.Showable {
 
     type ThisName <: Name
@@ -368,8 +368,8 @@ object Symbols {
   type TermSymbol = Symbol { type ThisName = TermName }
   type TypeSymbol = Symbol { type ThisName = TypeName }
 
-  class ClassSymbol private[Symbols] (coord: Coord, val assocFile: AbstractFile, id: Int)
-    extends Symbol(coord, id) {
+  class ClassSymbol private[Symbols] (coord: Coord, val assocFile: AbstractFile, id: Int, nestingLevel: Int)
+    extends Symbol(coord, id, nestingLevel) {
 
     type ThisName = TypeName
 
@@ -459,7 +459,7 @@ object Symbols {
     override protected def prefixString: String = "ClassSymbol"
   }
 
-  @sharable object NoSymbol extends Symbol(NoCoord, 0) {
+  @sharable object NoSymbol extends Symbol(NoCoord, 0, 0) {
     override def associatedFile(using Context): AbstractFile = NoSource.file
     override def recomputeDenot(lastd: SymDenotation)(using Context): SymDenotation = NoDenotation
   }
@@ -506,21 +506,6 @@ object Symbols {
   def MutableSymbolMap[T](): EqHashMap[Symbol, T] = EqHashMap[Symbol, T]()
   def MutableSymbolMap[T](initialCapacity: Int): EqHashMap[Symbol, T] = EqHashMap[Symbol, T](initialCapacity)
 
-// ---- Factory methods for symbol creation ----------------------
-//
-// All symbol creations should be done via the next two methods.
-
-  /** Create a symbol without a denotation.
-   *  Note this uses a cast instead of a direct type refinement because
-   *  it's debug-friendlier not to create an anonymous class here.
-   */
-  def newNakedSymbol[N <: Name](coord: Coord = NoCoord)(using Context): Symbol { type ThisName = N } =
-    new Symbol(coord, ctx.base.nextSymId).asInstanceOf[Symbol { type ThisName = N }]
-
-  /** Create a class symbol without a denotation. */
-  def newNakedClassSymbol(coord: Coord = NoCoord, assocFile: AbstractFile = null)(using Context): ClassSymbol =
-    new ClassSymbol(coord, assocFile, ctx.base.nextSymId)
-
 // ---- Symbol creation methods ----------------------------------
 
   /** Create a symbol from its fields (info may be lazy) */
@@ -531,18 +516,10 @@ object Symbols {
       info: Type,
       privateWithin: Symbol = NoSymbol,
       coord: Coord = NoCoord)(using Context): Symbol { type ThisName = N } = {
-    val sym = newNakedSymbol[N](coord)
+    val sym = new Symbol(coord, ctx.base.nextSymId, ctx.nestingLevel).asInstanceOf[Symbol { type ThisName = N }]
     val denot = SymDenotation(sym, owner, name, flags, info, privateWithin)
     sym.denot = denot
     sym
-  }
-
-  /** Create a class symbol from a function producing its denotation */
-  def newClassSymbolDenoting(denotFn: ClassSymbol => SymDenotation,
-       coord: Coord = NoCoord, assocFile: AbstractFile = null)(using Context): ClassSymbol = {
-    val cls = newNakedClassSymbol(coord, assocFile)
-    cls.denot = denotFn(cls)
-    cls
   }
 
   /** Create a class symbol from its non-info fields and a function
@@ -557,7 +534,7 @@ object Symbols {
       coord: Coord = NoCoord,
       assocFile: AbstractFile = null)(using Context): ClassSymbol
   = {
-    val cls = newNakedClassSymbol(coord, assocFile)
+    val cls = new ClassSymbol(coord, assocFile, ctx.base.nextSymId, ctx.nestingLevel)
     val denot = SymDenotation(cls, owner, name, flags, infoFn(cls), privateWithin)
     cls.denot = denot
     cls
@@ -569,7 +546,7 @@ object Symbols {
       name: TypeName,
       flags: FlagSet,
       parents: List[TypeRef],
-      decls: Scope = newScope,
+      decls: Scope,
       selfInfo: Type = NoType,
       privateWithin: Symbol = NoSymbol,
       coord: Coord = NoCoord,
@@ -587,7 +564,6 @@ object Symbols {
       name: TypeName,
       flags: FlagSet,
       parentTypes: List[Type],
-      decls: Scope = newScope,
       selfInfo: Type = NoType,
       privateWithin: Symbol = NoSymbol,
       coord: Coord = NoCoord,
@@ -603,7 +579,7 @@ object Symbols {
   }
 
   def newRefinedClassSymbol(coord: Coord = NoCoord)(using Context): ClassSymbol =
-    newCompleteClassSymbol(ctx.owner, tpnme.REFINE_CLASS, NonMember, parents = Nil, coord = coord)
+    newCompleteClassSymbol(ctx.owner, tpnme.REFINE_CLASS, NonMember, parents = Nil, newScope, coord = coord)
 
   /** Create a module symbol with associated module class
    *  from its non-info fields and a function producing the info
@@ -620,19 +596,15 @@ object Symbols {
       assocFile: AbstractFile = null)(using Context): TermSymbol
   = {
     val base = owner.thisType
-    val module = newNakedSymbol[TermName](coord)
-    val modcls = newNakedClassSymbol(coord, assocFile)
     val modclsFlags = clsFlags | ModuleClassCreationFlags
     val modclsName = name.toTypeName.adjustIfModuleClass(modclsFlags)
-    val cdenot = SymDenotation(
-        modcls, owner, modclsName, modclsFlags,
-        infoFn(module, modcls), privateWithin)
-    val mdenot = SymDenotation(
-        module, owner, name, modFlags | ModuleValCreationFlags,
-        if (cdenot.isCompleted) TypeRef(owner.thisType, modcls)
-        else new ModuleCompleter(modcls))
-    module.denot = mdenot
-    modcls.denot = cdenot
+    val module = newSymbol(
+      owner, name, modFlags | ModuleValCreationFlags, NoCompleter, privateWithin, coord)
+    val modcls = newClassSymbol(
+      owner, modclsName, modclsFlags, infoFn(module, _), privateWithin, coord, assocFile)
+    module.info =
+      if (modcls.isCompleted) TypeRef(owner.thisType, modcls)
+      else new ModuleCompleter(modcls)
     module
   }
 
@@ -673,7 +645,7 @@ object Symbols {
       name: TermName,
       modFlags: FlagSet = EmptyFlags,
       clsFlags: FlagSet = EmptyFlags,
-      decls: Scope = newScope)(using Context): TermSymbol =
+      decls: Scope = newScope(0))(using Context): TermSymbol =
     newCompleteModuleSymbol(
       owner, name,
       modFlags | PackageCreationFlags, clsFlags | PackageCreationFlags,
@@ -739,6 +711,10 @@ object Symbols {
       coord: Coord = NoCoord)(using Context): TermSymbol =
     newSymbol(cls, nme.CONSTRUCTOR, flags | Method, MethodType(paramNames, paramTypes, cls.typeRef), privateWithin, coord)
 
+  /** Create an anonymous function symbol */
+  def newAnonFun(owner: Symbol, info: Type, coord: Coord = NoCoord)(using Context): TermSymbol =
+    newSymbol(owner, nme.ANON_FUN, Synthetic | Method, info, coord = coord)
+
   /** Create an empty default constructor symbol for given class `cls`. */
   def newDefaultConstructor(cls: ClassSymbol)(using Context): TermSymbol =
     newConstructor(cls, EmptyFlags, Nil, Nil)
@@ -802,12 +778,13 @@ object Symbols {
       originals
     else {
       val copies: List[Symbol] = for (original <- originals) yield
-        original match {
-          case original: ClassSymbol =>
-            newNakedClassSymbol(original.coord, original.assocFile)
-          case _ =>
-            newNakedSymbol[original.ThisName](original.coord)
-        }
+        val odenot = original.denot
+        original.copy(
+          owner = ttmap.mapOwner(odenot.owner),
+          flags = odenot.flags &~ Touched,
+          info = NoCompleter,
+          privateWithin = ttmap.mapOwner(odenot.privateWithin),
+          coord = original.coord)
       val ttmap1 = ttmap.withSubstitution(originals, copies)
       originals.lazyZip(copies) foreach { (original, copy) =>
         val odenot = original.denot
@@ -845,13 +822,7 @@ object Symbols {
 
         end completer
 
-        copy.denot = odenot.copySymDenotation(
-          symbol = copy,
-          owner = ttmap1.mapOwner(odenot.owner),
-          initFlags = odenot.flags &~ Touched,
-          info = completer,
-          privateWithin = ttmap1.mapOwner(odenot.privateWithin), // since this refers to outer symbols, need not include copies (from->to) in ownermap here.
-          annotations = odenot.annotations)
+        copy.info = completer
         copy.denot match
           case cd: ClassDenotation =>
             cd.registeredCompanion = cd.unforcedRegisteredCompanion.subst(originals, copies)

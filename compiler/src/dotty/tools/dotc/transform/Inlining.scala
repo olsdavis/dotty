@@ -11,11 +11,11 @@ import Constants._
 import ast.Trees._
 import ast.{TreeTypeMap, untpd}
 import util.Spans._
-import tasty.TreePickler.Hole
 import SymUtils._
 import NameKinds._
 import dotty.tools.dotc.ast.tpd
 import typer.Implicits.SearchFailureType
+import typer.PrepareInlineable
 
 import scala.collection.mutable
 import dotty.tools.dotc.core.Annotations._
@@ -36,6 +36,8 @@ class Inlining extends MacroTransform {
   import Inlining._
 
   override def phaseName: String = Inlining.name
+
+  override def description: String = Inlining.description
 
   override def allowsImplicitSearch: Boolean = true
 
@@ -98,3 +100,4 @@ class Inlining extends MacroTransform {
 
 object Inlining:
   val name: String = "inlining"
+  val description: String = "inline and execute macros"

@@ -50,6 +50,7 @@ abstract class SignatureTest(
       (s"Not documented signatures:\n${expectedButNotFound.mkString("\n")}")
     val unexpectedReport = Option.when(!unexpected.isEmpty)
       (s"Unexpectedly documented signatures:\n${unexpected.mkString("\n")}")
+
     val reports = missingReport ++ unexpectedReport
 
     if !reports.isEmpty then
@@ -90,21 +91,21 @@ abstract class SignatureTest(
 
   private def signaturesFromSources(source: Source, kinds: Seq[String]): Seq[SignatureRes] =
     source.getLines.map(_.trim)
-        .filterNot(_.isEmpty)
-        .filterNot(_.startWithAnyOfThese("=",":","{","}", "//"))
-        .toSeq
-        .flatMap {
-          case unexpectedRegex(signature) => findName(signature, kinds).map(Unexpected(_))
-          case expectedRegex(signature) => findName(signature, kinds).map(Expected(_, signature))
-          case signature =>
-            findName(signature, kinds).map(
-              Expected(_, commentRegex.replaceAllIn(signature, "")
-                .compactWhitespaces.reverse.dropWhile(List('{', ':').contains(_)).reverse)
-            )
-        }
+      .filterNot(_.isEmpty)
+      .filterNot(_.startWithAnyOfThese("=",":","{","}", "//"))
+      .toSeq
+      .flatMap {
+        case unexpectedRegex(signature) => findName(signature, kinds).map(Unexpected(_))
+        case expectedRegex(signature) => findName(signature, kinds).map(Expected(_, signature))
+        case signature =>
+          findName(signature, kinds).map(
+            Expected(_, commentRegex.replaceAllIn(signature, "")
+              .compactWhitespaces.reverse.dropWhile(List('{', ':').contains(_)).reverse)
+          )
+      }
 
   private def signaturesFromDocumentation()(using DocContext): Seq[String] =
-    val output = summon[DocContext].args.output.toPath.resolve("api")
+    val output = summon[DocContext].args.output.toPath
     val signatures = List.newBuilder[String]
 
     def processFile(path: Path): Unit = if filterFunc(path) then
@@ -118,7 +119,7 @@ abstract class SignatureTest(
         val sigPrefix = elem.select(".header .signature").textNodes match
           case list if list.size > 0 && list.get(0).getWholeText().startsWith(" ") => " "
           case _ => ""
-        val all = s"$annotations$other $kind $name$sigPrefix$signature".trim()
+        val all = s"$annotations$other $sigPrefix$signature".trim()
         signatures += all
       }
 
@@ -128,6 +129,6 @@ abstract class SignatureTest(
 
 object SignatureTest {
   val classlikeKinds = Seq("class",  "object", "trait", "enum") // TODO add docs for packages
-  val members = Seq("type", "def", "val", "var")
+  val members = Seq("type", "def", "val", "var", "given")
   val all = classlikeKinds ++ members
 }

@@ -78,10 +78,11 @@ class ShadowingTests extends ReplTest(options = ShadowingTests.options):
     shadowed = "class C(val c: Int)",
     script =
       """|scala> new C().c
-         |-- Error:
+         |-- Error: ----------------------------------------------------------------------
          |1 | new C().c
          |  | ^^^^^^^
          |  | missing argument for parameter c of constructor C in class C: (c: Int): C
+         |1 error found
          |
          |scala> new C(13).c
          |val res0: Int = 13
@@ -94,7 +95,6 @@ class ShadowingTests extends ReplTest(options = ShadowingTests.options):
          |""".stripMargin
   )
 
-  @Ignore("not yet fixed")
   @Test def `shadow subdirectories on classpath` =
     // NB: Tests of shadowing of subdirectories on the classpath are only valid
     // when the subdirectories exist prior to initialization of the REPL driver.
@@ -127,9 +127,6 @@ class ShadowingTests extends ReplTest(options = ShadowingTests.options):
     ShadowingTests.createSubDir("util")
     testScript(name = "<shadow-subdir-util>",
       """|scala> import util.Try
-         |1 | import util.Try
-         |  |             ^^^
-         |  |             value Try is not a member of util
          |
          |scala> object util { class Try { override def toString = "you've gotta try!" }  }
          |// defined object util

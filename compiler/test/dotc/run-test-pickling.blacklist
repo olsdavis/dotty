@@ -1,3 +1,6 @@
+## Many of these tests fail because CompilationTests.pickling does not handle
+## tests containing java files correctly
+
 derive-generic.scala
 eff-dependent.scala
 enum-java
@@ -6,6 +9,8 @@ i7212
 i7868.scala
 i9011.scala
 i9473.scala
+i13433.scala
+i13433b.scala
 macros-in-same-project1
 mixin-forwarder-overload
 t10889
@@ -37,3 +42,5 @@ i12194.scala
 i12753
 t6138
 t6138-2
+i12656.scala
+trait-static-forwarder

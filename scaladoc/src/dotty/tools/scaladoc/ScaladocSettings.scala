@@ -18,12 +18,8 @@ import dotty.tools.dotc.core.Contexts._
 
 class ScaladocSettings extends SettingGroup with AllScalaSettings:
   val unsupportedSettings = Seq(
-    // Options that we like to support
-    extdirs, javabootclasspath, encoding,
     // Needed for plugin architecture
-    plugin,disable,require, pluginsDir, pluginOptions,
-    // we need support for sourcepath and sourceroot
-    sourcepath, sourceroot
+    plugin, disable, require, pluginsDir, pluginOptions,
   )
 
 
@@ -34,12 +30,15 @@ class ScaladocSettings extends SettingGroup with AllScalaSettings:
     StringSetting("-project-version", "project version", "The current version of your project.", "", aliases = List("-doc-version"))
 
   val projectLogo: Setting[String] =
-    StringSetting("-project-logo", "project logo filename", "The file that contains the project's logo (in /images).", "", aliases = List("-doc-logo"))
+    StringSetting("-project-logo", "project logo filename", "Path to the file that contains the project's logo. Provided path can be absolute or relative to the project root directory.", "", aliases = List("-doc-logo"))
 
   val projectFooter: Setting[String] = StringSetting("-project-footer", "project footer", "A footer on every Scaladoc page.", "", aliases = List("-doc-footer"))
 
   val sourceLinks: Setting[List[String]] =
     MultiStringSetting("-source-links", "sources", SourceLinks.usage)
+
+  val legacySourceLink: Setting[String] =
+    StringSetting("-doc-source-url", "sources", "Legacy option from Scala 2. Use -source-links instead.", "")
 
   val syntax: Setting[String] =
     StringSetting("-comment-syntax", "syntax", "Syntax of the comment used", "")
@@ -51,6 +50,9 @@ class ScaladocSettings extends SettingGroup with AllScalaSettings:
     MultiStringSetting("-external-mappings", "external-mappings",
       "Mapping between regexes matching classpath entries and external documentation. " +
         "'regex::[scaladoc|scaladoc|javadoc]::path' syntax is used")
+
+  val legacyExternalDocumentationMappings: Setting[List[String]] =
+    MultiStringSetting("-doc-external-doc", "legacy-external-mappings", "Legacy option from Scala 2. Mapping betweeen path and external documentation. Use -external-mappings instead.")
 
   val socialLinks: Setting[List[String]] =
     MultiStringSetting("-social-links", "social-links",
@@ -109,16 +111,29 @@ class ScaladocSettings extends SettingGroup with AllScalaSettings:
   )
 
   val YdocumentSyntheticTypes: Setting[Boolean] =
-    BooleanSetting("-Ydocument-synthetic-types", "Documents intrinsic types e. g. Any, Nothing. Setting is useful only for stdlib", false)
+    BooleanSetting("-Ydocument-synthetic-types", "Attach pages with documentation of the intrinsic types e. g. Any, Nothing to the docs. Setting is useful only for stdlib.", false)
 
   val snippetCompiler: Setting[List[String]] =
     MultiStringSetting("-snippet-compiler", "snippet-compiler", snippets.SnippetCompilerArgs.usage)
 
-  val snippetCompilerDebug: Setting[Boolean] =
-    BooleanSetting("-Ysnippet-compiler-debug", snippets.SnippetCompilerArgs.debugUsage, false)
-
   val generateInkuire: Setting[Boolean] =
     BooleanSetting("-Ygenerate-inkuire", "Generates InkuireDB and enables Hoogle-like searches", false)
 
+  val apiSubdirectory: Setting[Boolean] =
+    BooleanSetting("-Yapi-subdirectory", "Put the API documentation pages inside a directory `api/`", false)
+
+  val scastieConfiguration: Setting[String] =
+    StringSetting("-scastie-configuration", "Scastie configuration", "Additional configuration passed to Scastie in code snippets", "")
+
+  val defaultTemplate: Setting[String] =
+    StringSetting(
+      "-default-template",
+      "default template used by static site",
+      "The static site is generating empty files for indexes that haven't been provided explicitly in a sidebar/missing index.html in directory. " +
+        "User can specify what default template should be used for such indexes. It can be useful for providing generic templates that interpolate some common settings, like title, or can have some custom html embedded.",
+      ""
+    )
+
+
   def scaladocSpecificSettings: Set[Setting[_]] =
-    Set(sourceLinks, syntax, revision, externalDocumentationMappings, socialLinks, skipById, skipByRegex, deprecatedSkipPackages, docRootContent, snippetCompiler, snippetCompilerDebug, generateInkuire)
+    Set(sourceLinks, legacySourceLink, syntax, revision, externalDocumentationMappings, socialLinks, skipById, skipByRegex, deprecatedSkipPackages, docRootContent, snippetCompiler, generateInkuire, scastieConfiguration)

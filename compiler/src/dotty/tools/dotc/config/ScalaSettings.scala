@@ -1,11 +1,13 @@
 package dotty.tools.dotc
 package config
 
+import dotty.tools.dotc.config.PathResolver.Defaults
+import dotty.tools.dotc.config.Settings.{Setting, SettingGroup}
 import dotty.tools.dotc.core.Contexts._
-import dotty.tools.io.{ Directory, PlainDirectory, AbstractFile, JDK9Reflectors }
-import PathResolver.Defaults
-import rewrites.Rewrites
-import Settings.{ Setting, SettingGroup }
+import dotty.tools.dotc.rewrites.Rewrites
+import dotty.tools.io.{AbstractFile, Directory, JDK9Reflectors, PlainDirectory}
+
+import scala.util.chaining._
 
 class ScalaSettings extends SettingGroup with AllScalaSettings
 
@@ -22,7 +24,10 @@ object ScalaSettings:
       val jdkVersion = JDK9Reflectors.runtimeVersionMajor(JDK9Reflectors.runtimeVersion()).intValue()
       val maxVersion = Math.min(jdkVersion, maxTargetVersion)
       (minTargetVersion to maxVersion).toList.map(_.toString)
-    else List()
+    else List(minTargetVersion).map(_.toString)
+
+  def supportedScalaReleaseVersions: List[String] =
+    ScalaRelease.values.toList.map(_.show)
 
   def defaultClasspath: String = sys.env.getOrElse("CLASSPATH", ".")
 
@@ -38,23 +43,14 @@ object ScalaSettings:
     else defaultWidth
   }
 
-trait AllScalaSettings extends CommonScalaSettings, VerboseSettings, WarningSettings, XSettings, YSettings:
+trait AllScalaSettings extends CommonScalaSettings, PluginSettings, VerboseSettings, WarningSettings, XSettings, YSettings:
   self: SettingGroup =>
 
   /* Path related settings */
   val semanticdbTarget: Setting[String] = PathSetting("-semanticdb-target", "Specify an alternative output directory for SemanticDB files.", "")
 
-  val deprecation: Setting[Boolean] = BooleanSetting("-deprecation", "Emit warning and location for usages of deprecated APIs.", aliases = List("--deprecation"))
-  val explainTypes: Setting[Boolean] = BooleanSetting("-explain-types", "Explain type errors in more detail (deprecated, use -explain instead).", aliases = List("--explain-types"))
-    // this setting is necessary for cross compilation, since it is mentioned in sbt-tpolecat, for instance
-    // it is otherwise subsumed by -explain, and should be dropped as soon as we can.
-  val explain: Setting[Boolean] = BooleanSetting("-explain", "Explain errors in more detail.", aliases = List("--explain"))
-  val feature: Setting[Boolean] = BooleanSetting("-feature", "Emit warning and location for usages of features that should be imported explicitly.", aliases = List("--feature"))
-  val release: Setting[String] = ChoiceSetting("-release", "release", "Compile code with classes specific to the given version of the Java platform available on the classpath and emit bytecode for this version.", ScalaSettings.supportedReleaseVersions, "", aliases = List("--release"))
-  val source: Setting[String] = ChoiceSetting("-source", "source version", "source version", List("3.0", "future", "3.0-migration", "future-migration"), "3.0", aliases = List("--source"))
-  val unchecked: Setting[Boolean] = BooleanSetting("-unchecked", "Enable additional warnings where generated code depends on assumptions.", aliases = List("--unchecked"))
+  val source: Setting[String] = ChoiceSetting("-source", "source version", "source version", List("3.0", "3.1", "future", "3.0-migration", "future-migration"), "3.0", aliases = List("--source"))
   val uniqid: Setting[Boolean] = BooleanSetting("-uniqid", "Uniquely tag all identifiers in debugging output.", aliases = List("--unique-id"))
-  val language: Setting[List[String]] = MultiStringSetting("-language", "feature", "Enable one or more language features.", aliases = List("--language"))
   val rewrite: Setting[Option[Rewrites]] = OptionSetting[Rewrites]("-rewrite", "When used in conjunction with a `...-migration` source version, rewrites sources to migrate to new version.", aliases = List("--rewrite"))
   val fromTasty: Setting[Boolean] = BooleanSetting("-from-tasty", "Compile classes from tasty files. The arguments are .tasty or .jar files.", aliases = List("--from-tasty"))
 
@@ -80,10 +76,13 @@ trait AllScalaSettings extends CommonScalaSettings, VerboseSettings, WarningSett
   )
 
   val wikiSyntax: Setting[Boolean] = BooleanSetting("-Xwiki-syntax", "Retains the Scala2 behavior of using Wiki Syntax in Scaladoc.")
+
+  val jvmargs  = PrefixSetting("-J<flag>", "-J", "Pass <flag> directly to the runtime system.")
+  val defines  = PrefixSetting("-Dproperty=value", "-D", "Pass -Dproperty=value directly to the runtime system.")
 end AllScalaSettings
 
 /** Settings shared by compiler and scaladoc */
-trait CommonScalaSettings extends PluginSettings:
+trait CommonScalaSettings:
   self: SettingGroup =>
 
   /* Path related settings */
@@ -103,6 +102,16 @@ trait CommonScalaSettings extends PluginSettings:
   val help: Setting[Boolean] = BooleanSetting("-help", "Print a synopsis of standard options.", aliases = List("--help"))
   val pageWidth: Setting[Int] = IntSetting("-pagewidth", "Set page width", ScalaSettings.defaultPageWidth, aliases = List("--page-width"))
   val silentWarnings: Setting[Boolean] = BooleanSetting("-nowarn", "Silence all warnings.", aliases = List("--no-warnings"))
+
+  val release: Setting[String] = ChoiceSetting("-release", "release", "Compile code with classes specific to the given version of the Java platform available on the classpath and emit bytecode for this version.", ScalaSettings.supportedReleaseVersions, "", aliases = List("--release"))
+  val deprecation: Setting[Boolean] = BooleanSetting("-deprecation", "Emit warning and location for usages of deprecated APIs.", aliases = List("--deprecation"))
+  val feature: Setting[Boolean] = BooleanSetting("-feature", "Emit warning and location for usages of features that should be imported explicitly.", aliases = List("--feature"))
+  val explain: Setting[Boolean] = BooleanSetting("-explain", "Explain errors in more detail.", aliases = List("--explain"))
+  // -explain-types setting is necessary for cross compilation, since it is mentioned in sbt-tpolecat, for instance
+  // it is otherwise subsumed by -explain, and should be dropped as soon as we can.
+  val explainTypes: Setting[Boolean] = BooleanSetting("-explain-types", "Explain type errors in more detail (deprecated, use -explain instead).", aliases = List("--explain-types", "-explaintypes"))
+  val unchecked: Setting[Boolean] = BooleanSetting("-unchecked", "Enable additional warnings where generated code depends on assumptions.", initialValue = true, aliases = List("--unchecked"))
+  val language: Setting[List[String]] = MultiStringSetting("-language", "feature", "Enable one or more language features.", aliases = List("--language"))
 
   /* Other settings */
   val encoding: Setting[String] = StringSetting("-encoding", "encoding", "Specify character encoding used by source files.", Properties.sourceEncoding, aliases = List("--encoding"))
@@ -133,6 +142,64 @@ private sealed trait WarningSettings:
   val Whelp: Setting[Boolean] = BooleanSetting("-W", "Print a synopsis of warning options.")
   val XfatalWarnings: Setting[Boolean] = BooleanSetting("-Werror", "Fail the compilation if there are any warnings.", aliases = List("-Xfatal-warnings"))
 
+  val Wunused: Setting[List[String]] = MultiChoiceSetting(
+    name = "-Wunused",
+    helpArg = "warning",
+    descr = "Enable or disable specific `unused` warnings",
+    choices = List("nowarn", "all"),
+    default = Nil
+  )
+  object WunusedHas:
+    def allOr(s: String)(using Context) = Wunused.value.pipe(us => us.contains("all") || us.contains(s))
+    def nowarn(using Context) = allOr("nowarn")
+
+  val Wconf: Setting[List[String]] = MultiStringSetting(
+    "-Wconf",
+    "patterns",
+    default = List(),
+    descr =
+      s"""Configure compiler warnings.
+         |Syntax: -Wconf:<filters>:<action>,<filters>:<action>,...
+         |multiple <filters> are combined with &, i.e., <filter>&...&<filter>
+         |
+         |<filter>
+         |  - Any message: any
+         |
+         |  - Message categories: cat=deprecation, cat=feature, cat=unchecked
+         |
+         |  - Message content: msg=regex
+         |    The regex need only match some part of the message, not all of it.
+         |
+         |  - Message id: id=E129
+         |    The message id is printed with the warning.
+         |
+         |  - Message name: name=PureExpressionInStatementPosition
+         |    The message name is printed with the warning in verbose warning mode.
+         |
+         |In verbose warning mode the compiler prints matching filters for warnings.
+         |Verbose mode can be enabled globally using `-Wconf:any:verbose`, or locally
+         |using the @nowarn annotation (example: `@nowarn("v") def test = try 1`).
+         |
+         |<action>
+         |  - error / e
+         |  - warning / w
+         |  - verbose / v (emit warning, show additional help for writing `-Wconf` filters)
+         |  - info / i    (infos are not counted as warnings and not affected by `-Werror`)
+         |  - silent / s
+         |
+         |The default configuration is empty.
+         |
+         |User-defined configurations are added to the left. The leftmost rule matching
+         |a warning message defines the action.
+         |
+         |Examples:
+         |  - change every warning into an error: -Wconf:any:error
+         |  - silence deprecations: -Wconf:cat=deprecation:s
+         |
+         |Note: on the command-line you might need to quote configurations containing `*` or `&`
+         |to prevent the shell from expanding patterns.""".stripMargin,
+  )
+
 /** -X "Extended" or "Advanced" settings */
 private sealed trait XSettings:
   self: SettingGroup =>
@@ -156,6 +223,8 @@ private sealed trait XSettings:
   val Xsemanticdb: Setting[Boolean] = BooleanSetting("-Xsemanticdb", "Store information in SemanticDB.", aliases = List("-Ysemanticdb"))
   val Xtarget: Setting[String] = ChoiceSetting("-Xtarget", "target", "Emit bytecode for the specified version of the Java platform. This might produce bytecode that will break at runtime. When on JDK 9+, consider -release as a safer alternative.", ScalaSettings.supportedTargetVersions, "", aliases = List("--Xtarget"))
   val XcheckMacros: Setting[Boolean] = BooleanSetting("-Xcheck-macros", "Check some invariants of macro generated code while expanding macros", aliases = List("--Xcheck-macros"))
+  val XmainClass: Setting[String] = StringSetting("-Xmain-class", "path", "Class for manifest's Main-Class entry (only useful with -d <jar>)", "")
+  val XimplicitSearchLimit: Setting[Int] = IntSetting("-Ximplicit-search-limit", "Maximal number of expressions to be generated in an implicit search", 50000)
 
   val XmixinForceForwarders = ChoiceSetting(
     name    = "-Xmixin-force-forwarders",
@@ -168,6 +237,8 @@ private sealed trait XSettings:
     def isTruthy(using Context) = XmixinForceForwarders.value == "true"
     def isAtLeastJunit(using Context) = isTruthy || XmixinForceForwarders.value == "junit"
   }
+
+  val XmacroSettings: Setting[List[String]] = MultiStringSetting("-Xmacro-settings", "setting1,setting2,..settingN", "List of settings which exposed to the macros")
 end XSettings
 
 /** -Y "Forking" as in forked tongue or "Private" settings */
@@ -211,6 +282,7 @@ private sealed trait YSettings:
   val YprintSyms: Setting[Boolean] = BooleanSetting("-Yprint-syms", "When printing trees print info in symbols instead of corresponding info in trees.")
   val YprintDebug: Setting[Boolean] = BooleanSetting("-Yprint-debug", "When printing trees, print some extra information useful for debugging.")
   val YprintDebugOwners: Setting[Boolean] = BooleanSetting("-Yprint-debug-owners", "When printing trees, print owners of definitions.")
+  val YprintLevel: Setting[Boolean] = BooleanSetting("-Yprint-level", "print nesting levels of symbols and type variables.")
   val YshowPrintErrors: Setting[Boolean] = BooleanSetting("-Yshow-print-errors", "Don't suppress exceptions thrown during tree printing.")
   val YtestPickler: Setting[Boolean] = BooleanSetting("-Ytest-pickler", "Self-test for pickling functionality; should be used with -Ystop-after:pickler.")
   val YcheckReentrant: Setting[Boolean] = BooleanSetting("-Ycheck-reentrant", "Check that compiled program does not contain vars that can be accessed from a global root.")
@@ -238,6 +310,7 @@ private sealed trait YSettings:
   val YexplicitNulls: Setting[Boolean] = BooleanSetting("-Yexplicit-nulls", "Make reference types non-nullable. Nullable types can be expressed with unions: e.g. String|Null.")
   val YcheckInit: Setting[Boolean] = BooleanSetting("-Ysafe-init", "Ensure safe initialization of objects")
   val YrequireTargetName: Setting[Boolean] = BooleanSetting("-Yrequire-targetName", "Warn if an operator is defined without a @targetName annotation")
+  val YscalaRelease: Setting[String] = ChoiceSetting("-Yscala-release", "release", "Emit TASTy files that can be consumed by specified version of the compiler. The compilation will fail if for any reason valid TASTy cannot be produced (e.g. the code contains references to some parts of the standard library API that are missing in the older stdlib or uses language features unexpressible in the older version of TASTy format)", ScalaSettings.supportedScalaReleaseVersions, "", aliases = List("--Yscala-release"))
 
   /** Area-specific debug output */
   val YexplainLowlevel: Setting[Boolean] = BooleanSetting("-Yexplain-lowlevel", "When explaining type errors, show types at a lower level.")

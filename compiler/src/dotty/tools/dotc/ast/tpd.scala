@@ -7,6 +7,7 @@ import typer.ProtoTypes
 import transform.SymUtils._
 import transform.TypeUtils._
 import core._
+import Scopes.newScope
 import util.Spans._, Types._, Contexts._, Constants._, Names._, Flags._, NameOps._
 import Symbols._, StdNames._, Annotations._, Trees._, Symbols._
 import Decorators._, DenotTransformers._
@@ -44,7 +45,7 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
   def Apply(fn: Tree, args: List[Tree])(using Context): Apply = fn match
     case Block(Nil, expr) =>
       Apply(expr, args)
-    case _: RefTree | _: GenericApply | _: Inlined | _: tasty.TreePickler.Hole =>
+    case _: RefTree | _: GenericApply | _: Inlined | _: Hole =>
       ta.assignType(untpd.Apply(fn, args), fn, args)
 
   def TypeApply(fn: Tree, args: List[Tree])(using Context): TypeApply = fn match
@@ -121,9 +122,9 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
       Closure(Nil, call, targetTpt))
   }
 
-  /** A closure whole anonymous function has the given method type */
+  /** A closure whose anonymous function has the given method type */
   def Lambda(tpe: MethodType, rhsFn: List[Tree] => Tree)(using Context): Block = {
-    val meth = newSymbol(ctx.owner, nme.ANON_FUN, Synthetic | Method, tpe)
+    val meth = newAnonFun(ctx.owner, tpe)
     Closure(meth, tss => rhsFn(tss.head).changeOwner(ctx.owner, meth))
   }
 
@@ -205,8 +206,8 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
   def ValDef(sym: TermSymbol, rhs: LazyTree = EmptyTree)(using Context): ValDef =
     ta.assignType(untpd.ValDef(sym.name, TypeTree(sym.info), rhs), sym)
 
-  def SyntheticValDef(name: TermName, rhs: Tree)(using Context): ValDef =
-    ValDef(newSymbol(ctx.owner, name, Synthetic, rhs.tpe.widen, coord = rhs.span), rhs)
+  def SyntheticValDef(name: TermName, rhs: Tree, flags: FlagSet = EmptyFlags)(using Context): ValDef =
+    ValDef(newSymbol(ctx.owner, name, Synthetic | flags, rhs.tpe.widen, coord = rhs.span), rhs)
 
   def DefDef(sym: TermSymbol, paramss: List[List[Symbol]],
              resultType: Type, rhs: Tree)(using Context): DefDef =
@@ -1104,6 +1105,21 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
       if (sym.exists) sym.defTree = tree
       tree
     }
+
+    def etaExpandCFT(using Context): Tree =
+      def expand(target: Tree, tp: Type)(using Context): Tree = tp match
+        case defn.ContextFunctionType(argTypes, resType, isErased) =>
+          val anonFun = newAnonFun(
+            ctx.owner,
+            MethodType.companion(isContextual = true, isErased = isErased)(argTypes, resType),
+            coord = ctx.owner.coord)
+          def lambdaBody(refss: List[List[Tree]]) =
+            expand(target.select(nme.apply).appliedToArgss(refss), resType)(
+              using ctx.withOwner(anonFun))
+          Closure(anonFun, lambdaBody)
+        case _ =>
+          target
+      expand(tree, tree.tpe.widen)
   }
 
   inline val MapRecursionLimit = 10
@@ -1135,12 +1151,68 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
               case _ => tree1 :: rest1
           case nil => nil
       recur(trees, 0)
+
+    /** Transform statements while maintaining import contexts and expression contexts
+     *  in the same way as Typer does. The code addresses additional concerns:
+     *   - be tail-recursive where possible
+     *   - don't re-allocate trees where nothing has changed
+     */
+    inline def mapStatements[T](
+        exprOwner: Symbol,
+        inline op: Tree => Context ?=> Tree,
+        inline wrapResult: List[Tree] => Context ?=> T)(using Context): T =
+      @tailrec
+      def loop(mapped: mutable.ListBuffer[Tree] | Null, unchanged: List[Tree], pending: List[Tree])(using Context): T =
+        pending match
+          case stat :: rest =>
+            val statCtx = stat match
+              case _: DefTree | _: ImportOrExport => ctx
+              case _ => ctx.exprContext(stat, exprOwner)
+            val stat1 = op(stat)(using statCtx)
+            val restCtx = stat match
+              case stat: Import => ctx.importContext(stat, stat.symbol)
+              case _ => ctx
+            if stat1 eq stat then
+              loop(mapped, unchanged, rest)(using restCtx)
+            else
+              val buf = if mapped == null then new mutable.ListBuffer[Tree] else mapped
+              var xc = unchanged
+              while xc ne pending do
+                buf += xc.head
+                xc = xc.tail
+              stat1 match
+                case Thicket(stats1) => buf ++= stats1
+                case _ => buf += stat1
+              loop(buf, rest, rest)(using restCtx)
+          case nil =>
+            wrapResult(
+              if mapped == null then unchanged
+              else mapped.prependToList(unchanged))
+
+      loop(null, trees, trees)
+    end mapStatements
   end extension
+
+  /** A treemap that generates the same contexts as the original typer for statements.
+   *  This means:
+   *    - statements that are not definitions get the exprOwner as owner
+   *    - imports are reflected in the contexts of subsequent statements
+   */
+  class TreeMapWithPreciseStatContexts(cpy: TreeCopier = tpd.cpy) extends TreeMap(cpy):
+    def transformStats[T](trees: List[Tree], exprOwner: Symbol, wrapResult: List[Tree] => Context ?=> T)(using Context): T =
+      trees.mapStatements(exprOwner, transform(_), wrapResult)
+    final override def transformStats(trees: List[Tree], exprOwner: Symbol)(using Context): List[Tree] =
+      transformStats(trees, exprOwner, sameStats)
+    override def transformBlock(blk: Block)(using Context) =
+      transformStats(blk.stats, ctx.owner,
+        stats1 => ctx ?=> cpy.Block(blk)(stats1, transform(blk.expr)))
+
+  val sameStats: List[Tree] => Context ?=> List[Tree] = stats => stats
 
   /** Map Inlined nodes, NamedArgs, Blocks with no statements and local references to underlying arguments.
    *  Also drops Inline and Block with no statements.
    */
-  class MapToUnderlying extends TreeMap {
+  private class MapToUnderlying extends TreeMap {
     override def transform(tree: Tree)(using Context): Tree = tree match {
       case tree: Ident if isBinding(tree.symbol) && skipLocal(tree.symbol) =>
         tree.symbol.defTree match {
@@ -1322,7 +1394,11 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
   /** Recover identifier prefix (e.g. this) if it exists */
   def desugarIdentPrefix(tree: Ident)(using Context): Tree = tree.tpe match {
     case TermRef(prefix: TermRef, _) =>
-      ref(prefix)
+      prefix.info match
+        case mt: MethodType if mt.paramInfos.isEmpty && mt.resultType.typeSymbol.is(Module) =>
+          ref(mt.resultType.typeSymbol.sourceModule)
+        case _ =>
+          ref(prefix)
     case TermRef(prefix: ThisType, _) =>
       This(prefix.cls)
     case _ =>

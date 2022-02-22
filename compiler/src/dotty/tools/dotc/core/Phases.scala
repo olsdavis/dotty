@@ -13,10 +13,12 @@ import scala.collection.mutable.ListBuffer
 import dotty.tools.dotc.transform.MegaPhase._
 import dotty.tools.dotc.transform._
 import Periods._
-import typer.{FrontEnd, RefChecks}
+import parsing.{ Parser}
+import typer.{TyperPhase, RefChecks}
 import typer.ImportInfo.withRootImports
 import ast.tpd
 import scala.annotation.internal.sharable
+import scala.util.control.NonFatal
 
 object Phases {
 
@@ -64,7 +66,6 @@ object Phases {
                            YCheckAfter: List[String])(using Context): List[Phase] = {
       val fusedPhases = ListBuffer[Phase]()
       var prevPhases: Set[String] = Set.empty
-      val YCheckAll = YCheckAfter.contains("all")
 
       var stop = false
 
@@ -106,7 +107,7 @@ object Phases {
               phase
             }
           fusedPhases += phaseToAdd
-          val shouldAddYCheck = YCheckAfter.containsPhase(phaseToAdd) || YCheckAll
+          val shouldAddYCheck = filteredPhases(i).exists(_.isCheckable) && YCheckAfter.containsPhase(phaseToAdd)
           if (shouldAddYCheck) {
             val checker = new TreeChecker
             fusedPhases += checker
@@ -194,6 +195,7 @@ object Phases {
       config.println(s"nextDenotTransformerId = ${nextDenotTransformerId.toList}")
     }
 
+    private var myParserPhase: Phase = _
     private var myTyperPhase: Phase = _
     private var myPostTyperPhase: Phase = _
     private var mySbtExtractDependenciesPhase: Phase = _
@@ -205,6 +207,7 @@ object Phases {
     private var myRefChecksPhase: Phase = _
     private var myPatmatPhase: Phase = _
     private var myElimRepeatedPhase: Phase = _
+    private var myElimByNamePhase: Phase = _
     private var myExtensionMethodsPhase: Phase = _
     private var myExplicitOuterPhase: Phase = _
     private var myGettersPhase: Phase = _
@@ -215,6 +218,7 @@ object Phases {
     private var myFlattenPhase: Phase = _
     private var myGenBCodePhase: Phase = _
 
+    final def parserPhase: Phase = myParserPhase
     final def typerPhase: Phase = myTyperPhase
     final def postTyperPhase: Phase = myPostTyperPhase
     final def sbtExtractDependenciesPhase: Phase = mySbtExtractDependenciesPhase
@@ -226,6 +230,7 @@ object Phases {
     final def refchecksPhase: Phase = myRefChecksPhase
     final def patmatPhase: Phase = myPatmatPhase
     final def elimRepeatedPhase: Phase = myElimRepeatedPhase
+    final def elimByNamePhase: Phase = myElimByNamePhase
     final def extensionMethodsPhase: Phase = myExtensionMethodsPhase
     final def explicitOuterPhase: Phase = myExplicitOuterPhase
     final def gettersPhase: Phase = myGettersPhase
@@ -239,7 +244,8 @@ object Phases {
     private def setSpecificPhases() = {
       def phaseOfClass(pclass: Class[?]) = phases.find(pclass.isInstance).getOrElse(NoPhase)
 
-      myTyperPhase = phaseOfClass(classOf[FrontEnd])
+      myParserPhase = phaseOfClass(classOf[Parser])
+      myTyperPhase = phaseOfClass(classOf[TyperPhase])
       myPostTyperPhase = phaseOfClass(classOf[PostTyper])
       mySbtExtractDependenciesPhase = phaseOfClass(classOf[sbt.ExtractDependencies])
       myPicklerPhase = phaseOfClass(classOf[Pickler])
@@ -249,6 +255,7 @@ object Phases {
       myCollectNullableFieldsPhase = phaseOfClass(classOf[CollectNullableFields])
       myRefChecksPhase = phaseOfClass(classOf[RefChecks])
       myElimRepeatedPhase = phaseOfClass(classOf[ElimRepeated])
+      myElimByNamePhase = phaseOfClass(classOf[ElimByName])
       myExtensionMethodsPhase = phaseOfClass(classOf[ExtensionMethods])
       myErasurePhase = phaseOfClass(classOf[Erasure])
       myElimErasedValueTypePhase = phaseOfClass(classOf[ElimErasedValueType])
@@ -262,6 +269,7 @@ object Phases {
     }
 
     final def isAfterTyper(phase: Phase): Boolean = phase.id > typerPhase.id
+    final def isTyper(phase: Phase): Boolean = phase.id == typerPhase.id
   }
 
   abstract class Phase {
@@ -290,7 +298,7 @@ object Phases {
     /** If set, implicit search is enabled */
     def allowsImplicitSearch: Boolean = false
 
-     /** List of names of phases that should precede this phase */
+    /** List of names of phases that should precede this phase */
     def runsAfter: Set[String] = Set.empty
 
     /** @pre `isRunnable` returns true */
@@ -313,8 +321,8 @@ object Phases {
      */
     def checkPostCondition(tree: tpd.Tree)(using Context): Unit = ()
 
-    /** Is this phase the standard typerphase? True for FrontEnd, but
-     *  not for other first phases (such as FromTasty). The predicate
+    /** Is this phase the standard typerphase? True for TyperPhase, but
+     *  not for other first phases (such as FromTasty or Parser). The predicate
      *  is tested in some places that perform checks and corrections. It's
      *  different from ctx.isAfterTyper (and cheaper to test).
      */
@@ -402,9 +410,17 @@ object Phases {
     final def iterator: Iterator[Phase] =
       Iterator.iterate(this)(_.next) takeWhile (_.hasNext)
 
+    final def monitor(doing: String)(body: => Unit)(using Context): Unit =
+      try body
+      catch
+        case NonFatal(ex) =>
+          report.echo(s"exception occurred while $doing ${ctx.compilationUnit}")
+          throw ex
+
     override def toString: String = phaseName
   }
 
+  def parserPhase(using Context): Phase                 = ctx.base.parserPhase
   def typerPhase(using Context): Phase                  = ctx.base.typerPhase
   def postTyperPhase(using Context): Phase              = ctx.base.postTyperPhase
   def sbtExtractDependenciesPhase(using Context): Phase = ctx.base.sbtExtractDependenciesPhase
@@ -414,6 +430,7 @@ object Phases {
   def firstTransformPhase(using Context): Phase         = ctx.base.firstTransformPhase
   def refchecksPhase(using Context): Phase              = ctx.base.refchecksPhase
   def elimRepeatedPhase(using Context): Phase           = ctx.base.elimRepeatedPhase
+  def elimByNamePhase(using Context): Phase             = ctx.base.elimByNamePhase
   def extensionMethodsPhase(using Context): Phase       = ctx.base.extensionMethodsPhase
   def explicitOuterPhase(using Context): Phase          = ctx.base.explicitOuterPhase
   def gettersPhase(using Context): Phase                = ctx.base.gettersPhase

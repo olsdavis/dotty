@@ -524,6 +524,15 @@ object TypeErasure {
     case tp: OrType  => hasStableErasure(tp.tp1) && hasStableErasure(tp.tp2)
     case _ => false
   }
+
+  /** The erasure of `PolyFunction { def apply: $applyInfo }` */
+  def erasePolyFunctionApply(applyInfo: Type)(using Context): Type =
+    assert(applyInfo.isInstanceOf[PolyType])
+    val res = applyInfo.resultType
+    val paramss = res.paramNamess
+    assert(paramss.length == 1)
+    erasure(defn.FunctionType(paramss.head.length,
+      isContextual = res.isImplicitMethod, isErased = res.isErasedMethod))
 }
 
 import TypeErasure._
@@ -581,7 +590,7 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
       val sym = tp.symbol
       if (!sym.isClass) this(tp.translucentSuperType)
       else if (semiEraseVCs && isDerivedValueClass(sym)) eraseDerivedValueClass(tp)
-      else if (defn.isSyntheticFunctionClass(sym)) defn.erasedFunctionType(sym)
+      else if (defn.isSyntheticFunctionClass(sym)) defn.functionTypeErasure(sym)
       else eraseNormalClassRef(tp)
     case tp: AppliedType =>
       val tycon = tp.tycon
@@ -597,11 +606,7 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
     case ExprType(rt) =>
       defn.FunctionType(0)
     case RefinedType(parent, nme.apply, refinedInfo) if parent.typeSymbol eq defn.PolyFunctionClass =>
-      assert(refinedInfo.isInstanceOf[PolyType])
-      val res = refinedInfo.resultType
-      val paramss = res.paramNamess
-      assert(paramss.length == 1)
-      this(defn.FunctionType(paramss.head.length, isContextual = res.isImplicitMethod, isErased = res.isErasedMethod))
+      erasePolyFunctionApply(refinedInfo)
     case tp: TypeProxy =>
       this(tp.underlying)
     case tp @ AndType(tp1, tp2) =>
@@ -654,7 +659,14 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
               tr1 :: trs1.filterNot(_.isAnyRef)
             case nil => nil
           }
-        val erasedDecls = decls.filteredScope(sym => !sym.isType || sym.isClass)
+        var erasedDecls = decls.filteredScope(sym => !sym.isType || sym.isClass).openForMutations
+        for dcl <- erasedDecls.iterator do
+          if dcl.lastKnownDenotation.unforcedAnnotation(defn.TargetNameAnnot).isDefined
+             && dcl.targetName != dcl.name
+          then
+            if erasedDecls eq decls then erasedDecls = erasedDecls.cloneScope
+            erasedDecls.unlink(dcl)
+            erasedDecls.enter(dcl.targetName, dcl)
         val selfType1 = if cls.is(Module) then cls.sourceModule.termRef else NoType
         tp.derivedClassInfo(NoPrefix, erasedParents, erasedDecls, selfType1)
           // can't replace selftype by NoType because this would lose the sourceModule link
@@ -784,7 +796,7 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
           if (erasedVCRef.exists) return sigName(erasedVCRef)
         }
         if (defn.isSyntheticFunctionClass(sym))
-          sigName(defn.erasedFunctionType(sym))
+          sigName(defn.functionTypeErasure(sym))
         else
           val cls = normalizeClass(sym.asClass)
           val fullName =

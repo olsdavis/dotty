@@ -34,13 +34,19 @@ import StdNames._
 import dotty.tools.io._
 
 class GenBCode extends Phase {
-  def phaseName: String = GenBCode.name
+
+  override def phaseName: String = GenBCode.name
+
+  override def description: String = GenBCode.description
 
   private val superCallsMap = new MutableSymbolMap[Set[ClassSymbol]]
   def registerSuperCall(sym: Symbol, calls: ClassSymbol): Unit = {
     val old = superCallsMap.getOrElse(sym, Set.empty)
     superCallsMap.update(sym, old + calls)
   }
+
+  private val entryPoints = new mutable.HashSet[String]()
+  def registerEntryPoint(s: String): Unit = entryPoints += s
 
   private var myOutput: AbstractFile = _
 
@@ -61,21 +67,49 @@ class GenBCode extends Phase {
 
 
   override def runOn(units: List[CompilationUnit])(using Context): List[CompilationUnit] = {
+    outputDir match
+      case jar: JarArchive =>
+        updateJarManifestWithMainClass(jar, entryPoints.toList)
+      case _ =>
     try super.runOn(units)
-    finally myOutput match {
+    finally outputDir match {
       case jar: JarArchive =>
         if (ctx.run.suspendedUnits.nonEmpty)
           // If we close the jar the next run will not be able to write on the jar.
           // But if we do not close it we cannot use it as part of the macro classpath of the suspended files.
           report.error("Can not suspend and output to a jar at the same time. See suspension with -Xprint-suspension.")
+
         jar.close()
       case _ =>
     }
   }
+
+  private def updateJarManifestWithMainClass(jarArchive: JarArchive, entryPoints: List[String])(using Context): Unit =
+    val mainClass = Option.when(!ctx.settings.XmainClass.isDefault)(ctx.settings.XmainClass.value).orElse {
+      entryPoints match
+        case List(mainClass) =>
+          Some(mainClass)
+        case Nil =>
+          report.warning("No Main-Class designated or discovered.")
+          None
+        case mcs =>
+          report.warning(s"No Main-Class due to multiple entry points:\n  ${mcs.mkString("\n  ")}")
+          None
+    }
+    mainClass.map { mc =>
+      val manifest = Jar.WManifest()
+      manifest.mainClass = mc
+      val file = jarArchive.subdirectoryNamed("META-INF").fileNamed("MANIFEST.MF")
+      val os = file.output
+      manifest.underlying.write(os)
+      os.close()
+    }
+  end updateJarManifestWithMainClass
 }
 
 object GenBCode {
   val name: String = "genBCode"
+  val description: String = "generate JVM bytecode"
 }
 
 class GenBCodePipeline(val int: DottyBackendInterface, val primitives: DottyPrimitives)(using Context) extends BCodeSyncAndTry {

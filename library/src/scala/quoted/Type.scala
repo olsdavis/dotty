@@ -1,6 +1,6 @@
 package scala.quoted
 
-import scala.annotation.{compileTimeOnly, experimental}
+import scala.annotation.{compileTimeOnly, experimental, since}
 
 /** Type (or type constructor) `T` needed contextually when using `T` in a quoted expression `'{... T ...}` */
 abstract class Type[T <: AnyKind] private[scala]:
@@ -27,10 +27,19 @@ object Type:
    *
    *  Example usage:
    *  ```scala
-   *  ... match
+   *  //{
+   *  import scala.deriving.*
+   *  def f(using Quotes) = {
+   *  import quotes.reflect.*
+   *  val expr: Expr[Any] = ???
+   *  //}
+   *  expr match {
    *    case '{ $mirrorExpr : Mirror.Sum { type MirroredLabel = label } } =>
    *      Type.valueOfConstant[label] // Option[String]
    *  }
+   *  //{
+   *  }
+   *  //}
    *  ```
    *  @syntax markdown
    */
@@ -43,14 +52,23 @@ object Type:
    *
    *  Example usage:
    *  ```scala
-   *  ... match
-   *    case '{ $mirrorExpr : Mirror.Sum { type MirroredElemLabels = label } } =>
+   *  //{
+   *  import scala.deriving.*
+   *  def f(using Quotes) = {
+   *  import quotes.reflect.*
+   *  val expr: Expr[Any] = ???
+   *  //}
+   *  expr match {
+   *    case '{ type label <: Tuple; $mirrorExpr : Mirror.Sum { type MirroredElemLabels = `label` } } =>
    *      Type.valueOfTuple[label] // Option[Tuple]
    *  }
+   *  //{
+   *  }
+   *  //}
    *  ```
    *  @syntax markdown
    */
-  @experimental
+  @since("3.1")
   def valueOfTuple[T <: Tuple](using Type[T])(using Quotes): Option[T] =
     valueOfTuple(quotes.reflect.TypeRepr.of[T]).asInstanceOf[Option[T]]
 

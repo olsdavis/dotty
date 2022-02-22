@@ -7,7 +7,7 @@ import dotc.core.Contexts._
 import dotc.core.StdNames.str
 import dotc.parsing.Parsers.Parser
 import dotc.parsing.Tokens
-import dotc.reporting.Diagnostic
+import dotc.reporting.{Diagnostic, StoreReporter}
 import dotc.util.SourceFile
 
 import scala.annotation.internal.sharable
@@ -16,7 +16,7 @@ import scala.annotation.internal.sharable
 sealed trait ParseResult
 
 /** An error free parsing resulting in a list of untyped trees */
-case class Parsed(source: SourceFile, trees: List[untpd.Tree]) extends ParseResult
+case class Parsed(source: SourceFile, trees: List[untpd.Tree], reporter: StoreReporter) extends ParseResult
 
 /** A parsing result containing syntax `errors` */
 case class SyntaxErrors(sourceCode: String,
@@ -80,10 +80,16 @@ case object Imports extends Command {
   val command: String = ":imports"
 }
 
+case class Settings(arg: String) extends Command
+object Settings {
+  val command: String = ":settings"
+}
+
 /** Reset the session to the initial state from when the repl program was
  *  started
  */
-case object Reset extends Command {
+case class Reset(arg: String) extends Command
+object Reset {
   val command: String = ":reset"
 }
 
@@ -105,7 +111,8 @@ case object Help extends Command {
       |:type <expression>       evaluate the type of the given expression
       |:doc <expression>        print the documentation for the given expression
       |:imports                 show import history
-      |:reset                   reset the repl to its initial state, forgetting all session entries
+      |:reset [options]         reset the repl to its initial state, forgetting all session entries
+      |:settings <options>      update compiler options, if possible
     """.stripMargin
 }
 
@@ -124,11 +131,12 @@ object ParseResult {
     Quit.command -> (_ => Quit),
     Quit.alias -> (_ => Quit),
     Help.command -> (_  => Help),
-    Reset.command -> (_  => Reset),
+    Reset.command -> (arg  => Reset(arg)),
     Imports.command -> (_  => Imports),
     Load.command -> (arg => Load(arg)),
     TypeOf.command -> (arg => TypeOf(arg)),
-    DocOf.command -> (arg => DocOf(arg))
+    DocOf.command -> (arg => DocOf(arg)),
+    Settings.command -> (arg => Settings(arg)),
   )
 
   def apply(source: SourceFile)(implicit state: State): ParseResult = {
@@ -154,7 +162,7 @@ object ParseResult {
               reporter.removeBufferedMessages,
               stats)
           else
-            Parsed(source, stats)
+            Parsed(source, stats, reporter)
         }
     }
   }

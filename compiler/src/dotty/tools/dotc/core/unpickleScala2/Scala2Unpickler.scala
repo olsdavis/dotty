@@ -233,7 +233,7 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
   }
 
   /** The `decls` scope associated with given symbol */
-  protected def symScope(sym: Symbol): Scope = symScopes.getOrElseUpdate(sym, newScope)
+  protected def symScope(sym: Symbol): Scope = symScopes.getOrElseUpdate(sym, newScope(0))
 
   /** Does entry represent an (internal) symbol */
   protected def isSymbolEntry(i: Int)(using Context): Boolean = {
@@ -739,7 +739,7 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
       val anyTypes = boundSyms map (_ => defn.AnyType)
       val boundBounds = boundSyms map (_.info.bounds.hi)
       val tp2 = tp1.subst(boundSyms, boundBounds).subst(boundSyms, anyTypes)
-      report.warning(FailureToEliminateExistential(tp, tp1, tp2, boundSyms))
+      report.warning(FailureToEliminateExistential(tp, tp1, tp2, boundSyms, classRoot.symbol))
       tp2
     }
     else tp1
@@ -847,6 +847,12 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
         val maker = MethodType.companion(
           isImplicit = tag == IMPLICITMETHODtpe || params.nonEmpty && params.head.is(Implicit))
         val result = maker.fromSymbols(params, restpe)
+        result.resType match
+          case restpe1: MethodType if restpe1 ne restpe =>
+            val prevResParams = paramsOfMethodType.remove(restpe)
+            if prevResParams != null then
+              paramsOfMethodType.put(restpe1, prevResParams)
+          case _ =>
         if params.nonEmpty then paramsOfMethodType.put(result, params)
         result
       case POLYtpe =>
@@ -953,33 +959,33 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
   /** Read an annotation argument, which is pickled either
    *  as a Constant or a Tree.
    */
-  protected def readAnnotArg(i: Int)(using Context): Tree = bytes(index(i)) match {
+  protected def readAnnotArg(i: Int)(using Context): untpd.Tree = untpd.TypedSplice(bytes(index(i)) match
     case TREE => at(i, () => readTree())
     case _ => at(i, () =>
       readConstant() match
         case c: Constant => Literal(c)
         case tp: TermRef => ref(tp)
     )
-  }
+  )
 
   /** Read a ClassfileAnnotArg (argument to a classfile annotation)
    */
-  private def readArrayAnnotArg()(using Context): Tree = {
+  private def readArrayAnnotArg()(using Context): untpd.Tree = {
     readByte() // skip the `annotargarray` tag
     val end = readNat() + readIndex
     // array elements are trees representing instances of scala.annotation.Annotation
-    SeqLiteral(
+    untpd.JavaSeqLiteral(
       until(end, () => readClassfileAnnotArg(readNat())),
-      TypeTree(defn.AnnotationClass.typeRef))
+      untpd.TypeTree())
   }
 
-  private def readAnnotInfoArg()(using Context): Tree = {
+  private def readAnnotInfoArg()(using Context): untpd.Tree = untpd.TypedSplice {
     readByte() // skip the `annotinfo` tag
     val end = readNat() + readIndex
     readAnnotationContents(end)
   }
 
-  protected def readClassfileAnnotArg(i: Int)(using Context): Tree = bytes(index(i)) match {
+  protected def readClassfileAnnotArg(i: Int)(using Context): untpd.Tree = bytes(index(i)) match {
     case ANNOTINFO => at(i, () => readAnnotInfoArg())
     case ANNOTARGARRAY => at(i, () => readArrayAnnotArg())
     case _ => readAnnotArg(i)
@@ -991,7 +997,7 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
   protected def readAnnotationContents(end: Int)(using Context): Tree = {
     val atp = readTypeRef()
     val args = {
-      val t = new ListBuffer[Tree]
+      val t = new ListBuffer[untpd.Tree]
 
       while (readIndex != end) {
         val argref = readNat()
@@ -999,14 +1005,14 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
           if (isNameEntry(argref)) {
             val name = at(argref, () => readName())
             val arg = readClassfileAnnotArg(readNat())
-            NamedArg(name.asTermName, arg)
+            untpd.NamedArg(name.asTermName, arg)
           }
           else readAnnotArg(argref)
         }
       }
       t.toList
     }
-    resolveConstructor(atp, args)
+    untpd.resolveConstructor(atp, args)
   }
 
   /** Read an annotation and as a side effect store it into

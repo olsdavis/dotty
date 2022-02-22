@@ -20,8 +20,15 @@ class DocRender(signatureRenderer: SignatureRenderer)(using DocContext):
       renderLink(link, default => text(if name.isEmpty then default else name)).toString
     ))
 
-  private def listItems(items: Seq[WikiDocElement]) =
-    items.map(i => li(renderElement(i)))
+  private def listItems(items: Seq[WikiDocElement]): Seq[AppliedTag] = items match
+    case Nil => Nil
+    case (x :: (y: (UnorderedList | OrderedList)) :: tail) =>
+      li(
+        renderElement(x),
+        renderElement(y)
+      ) +: listItems(tail)
+    case (x :: tail) =>
+      li(renderElement(x)) +: listItems(tail)
   private def notSupported(name: String, content: AppliedTag): AppliedTag =
     report.warning(s"Wiki syntax does not support $name in ${signatureRenderer.currentDri.location}")
     content
@@ -35,6 +42,16 @@ class DocRender(signatureRenderer: SignatureRenderer)(using DocContext):
         val tooltip = s"Problem linking $query: $msg"
         signatureRenderer.unresolvedLink(linkBody(query), titleAttr :=  tooltip)
 
+  private def renderHeader(header: Row): AppliedTag =
+    tr(
+      header.cells.map(c => th(c.blocks.map(renderElement)))
+    )
+
+  private def renderRow(row: Row): AppliedTag =
+    tr(
+      row.cells.map(c => td(c.blocks.map(renderElement)))
+    )
+
   private def renderElement(e: WikiDocElement): AppliedTag = e match
     case Title(text, level) =>
       val content = renderElement(text)
@@ -46,8 +63,17 @@ class DocRender(signatureRenderer: SignatureRenderer)(using DocContext):
           case 5 => h5(content)
           case 6 => h6(content)
     case Paragraph(text) => p(renderElement(text))
-    case Code(data: String) => pre(code(raw(data))) // TODO add classes
+    case Code(data: String) => pre(code(raw(data.escapeReservedTokens))) // TODO add classes
     case HorizontalRule => hr
+    case Table(header, columns, rows) =>
+      table(
+        thead(
+          renderHeader(header)
+        ),
+        tbody(
+          rows.map(renderRow)
+        )
+      )
 
     case UnorderedList(items) => ul(listItems(items))
     case OrderedList(items, style) => ol(listItems(items)) // TODO use style
@@ -59,8 +85,8 @@ class DocRender(signatureRenderer: SignatureRenderer)(using DocContext):
     case Superscript(text) => span(cls:="superscript")(renderElement(text))  // TODO implement style
     case Subscript(text) => span(cls:="subscript")(renderElement(text))  // TODO implement style
     case Link(target, body) =>
-      renderLink(target, default => body.fold[TagArg](text(default))(renderElement))
-    case Text(text) => raw(text)
+      renderLink(target, default => body.fold[TagArg](default)(renderElement))
+    case Text(text) => raw(text.escapeReservedTokens)
     case Summary(text) => renderElement(text)
     case HtmlTag(content) => raw(content)
 

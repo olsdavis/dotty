@@ -55,10 +55,12 @@ object Scaladoc:
     docCanonicalBaseUrl: String = "",
     documentSyntheticTypes: Boolean = false,
     snippetCompiler: List[String] = Nil,
-    snippetCompilerDebug: Boolean = false,
     noLinkWarnings: Boolean = false,
     versionsDictionaryUrl: Option[String] = None,
-    generateInkuire : Boolean = false
+    generateInkuire : Boolean = false,
+    apiSubdirectory : Boolean = false,
+    scastieConfiguration: String = "",
+    defaultTemplate: Option[String] = None,
   )
 
   def run(args: Array[String], rootContext: CompilerContext): Reporter =
@@ -168,6 +170,8 @@ object Scaladoc:
           CommentSyntax.default
         }
       }
+      val legacySourceLinkList = if legacySourceLink.get.nonEmpty then List(legacySourceLink.get) else Nil
+
       val externalMappings =
         externalDocumentationMappings.get.flatMap( s =>
             ExternalDocLink.parse(s).fold(left => {
@@ -176,6 +180,15 @@ object Scaladoc:
             }, right => Some(right)
           )
         )
+
+      val legacyExternalMappings =
+        legacyExternalDocumentationMappings.get.flatMap { s =>
+          ExternalDocLink.parseLegacy(s).fold(left => {
+              report.warning(left)
+              None
+            }, right => Some(right)
+          )
+        }
 
       val socialLinksParsed =
         socialLinks.get.flatMap { s =>
@@ -207,9 +220,9 @@ object Scaladoc:
         projectLogo.nonDefault,
         projectFooter.nonDefault,
         parseSyntax,
-        sourceLinks.get,
+        sourceLinks.get ++ legacySourceLinkList,
         revision.nonDefault,
-        externalMappings,
+        externalMappings ++ legacyExternalMappings,
         socialLinksParsed,
         skipById.get ++ deprecatedSkipPackages.get,
         skipByRegex.get,
@@ -221,9 +234,11 @@ object Scaladoc:
         YdocumentSyntheticTypes.get,
         snippetCompiler.get,
         noLinkWarnings.get,
-        snippetCompilerDebug.get,
         versionsDictionaryUrl.nonDefault,
-        generateInkuire.get
+        generateInkuire.get,
+        apiSubdirectory.get,
+        scastieConfiguration.get,
+        defaultTemplate.nonDefault
       )
       (Some(docArgs), newContext)
     }
@@ -231,7 +246,6 @@ object Scaladoc:
   private [scaladoc] def run(args: Args)(using ctx: CompilerContext): DocContext =
     given docContext: DocContext = new DocContext(args, ctx)
     val module = ScalaModuleProvider.mkModule()
-
     new dotty.tools.scaladoc.renderers.HtmlRenderer(module.rootPackage, module.members).render()
     report.inform("generation completed successfully")
     docContext

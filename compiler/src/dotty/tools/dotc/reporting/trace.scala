@@ -7,6 +7,12 @@ import config.Config
 import config.Printers
 import core.Mode
 
+/** Exposes the {{{ trace("question") { op } }}} syntax.
+ *
+ * Traced operations will print indented messages if enabled.
+ * Tracing depends on [[Config.tracingEnabled]] and [[dotty.tools.dotc.config.ScalaSettings.Ylog]].
+ * Tracing can be forced by replacing [[trace]] with [[trace.force]] or [[trace.log]] (see below).
+ */
 object trace extends TraceSyntax:
   inline def isEnabled = Config.tracingEnabled
   protected val isForced = false
@@ -14,6 +20,10 @@ object trace extends TraceSyntax:
   object force extends TraceSyntax:
     inline def isEnabled: true = true
     protected val isForced = true
+
+  object log extends TraceSyntax:
+    inline def isEnabled: true = true
+    protected val isForced = false
 end trace
 
 /** This module is carefully optimized to give zero overhead if Config.tracingEnabled
@@ -33,7 +43,7 @@ trait TraceSyntax:
       apply(question, if cond then Printers.default else Printers.noPrinter, show)(op)
     else op
 
-  inline def apply[T](inline question: String, inline printer: Printers.Printer, inline showOp: Any => String)(inline op: T)(using Context): T =
+  inline def apply[T, U >: T](inline question: String, inline printer: Printers.Printer, inline showOp: U => String)(inline op: T)(using Context): T =
     inline if isEnabled then
       doTrace[T](question, printer, showOp)(op)
     else op
@@ -60,20 +70,20 @@ trait TraceSyntax:
 
   private def doTrace[T](question: => String,
                          printer: Printers.Printer = Printers.default,
-                         showOp: Any => String = alwaysToString)
+                         showOp: T => String = alwaysToString)
                         (op: => T)(using Context): T =
     if ctx.mode.is(Mode.Printing) || !isForced && (printer eq Printers.noPrinter) then op
     else
       // Avoid evaluating question multiple time, since each evaluation
       // may cause some extra logging output.
-      val q = question
+      val q = question.replace('\n', ' ')
       val leading = s"==> $q?"
-      val trailing = (res: Any) => s"<== $q = ${showOp(res)}"
+      val trailing = (res: T) => s"<== $q = ${showOp(res)}"
       var finalized = false
       var logctx = ctx
       while logctx.reporter.isInstanceOf[StoreReporter] do logctx = logctx.outer
       def margin = ctx.base.indentTab * ctx.base.indent
-      def doLog(s: String) = if isForced then println(s) else report.log(s)
+      def doLog(s: String) = if isForced then println(s) else report.log(s)(using logctx)
       def finalize(msg: String) =
         if !finalized then
           ctx.base.indent -= 1

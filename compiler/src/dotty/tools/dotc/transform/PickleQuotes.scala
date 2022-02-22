@@ -11,7 +11,6 @@ import Constants._
 import ast.Trees._
 import ast.{TreeTypeMap, untpd}
 import util.Spans._
-import tasty.TreePickler.Hole
 import SymUtils._
 import NameKinds._
 import dotty.tools.dotc.ast.tpd
@@ -73,6 +72,8 @@ class PickleQuotes extends MacroTransform {
   import tpd._
 
   override def phaseName: String = PickleQuotes.name
+
+  override def description: String = PickleQuotes.description
 
   override def allowsImplicitSearch: Boolean = true
 
@@ -529,6 +530,7 @@ object PickleQuotes {
   import tpd._
 
   val name: String = "pickleQuotes"
+  val description: String = "turn quoted trees into explicit run-time data structures"
 
   def getLiteral(tree: tpd.Tree): Option[Literal] = tree match {
     case tree: Literal => Some(tree)

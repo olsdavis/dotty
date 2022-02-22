@@ -1,7 +1,7 @@
 package dotty.tools.dotc.reporting
 
 /** Unique IDs identifying the messages */
-enum ErrorMessageID extends java.lang.Enum[ErrorMessageID] {
+enum ErrorMessageID extends java.lang.Enum[ErrorMessageID]:
 
   // IMPORTANT: Add new IDs only at the end and never remove IDs
   case
@@ -174,7 +174,14 @@ enum ErrorMessageID extends java.lang.Enum[ErrorMessageID] {
     OverrideTypeMismatchErrorID,
     OverrideErrorID,
     MatchableWarningID,
-    CannotExtendFunctionID
+    CannotExtendFunctionID,
+    LossyWideningConstantConversionID,
+    ImplicitSearchTooLargeID
 
   def errorNumber = ordinal - 2
-}
+
+object ErrorMessageID:
+  def fromErrorNumber(n: Int): Option[ErrorMessageID] =
+    val enumId = n + 2
+    if enumId >= 2 && enumId < ErrorMessageID.values.length then Some(fromOrdinal(enumId))
+    else None

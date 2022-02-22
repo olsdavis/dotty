@@ -252,14 +252,14 @@ object Interactive {
    *  the tree closest enclosing `pos` and ends with an element of `trees`.
    */
   def pathTo(trees: List[SourceTree], pos: SourcePosition)(using Context): List[Tree] =
-    trees.find(_.pos.contains(pos)) match {
-      case Some(tree) => pathTo(tree.tree, pos.span)
-      case None => Nil
-    }
+    pathTo(trees.map(_.tree), pos.span)
 
   def pathTo(tree: Tree, span: Span)(using Context): List[Tree] =
-    if (tree.span.contains(span))
-      NavigateAST.pathTo(span, tree, skipZeroExtent = true)
+    pathTo(List(tree), span)
+
+  private def pathTo(trees: List[Tree], span: Span)(using Context): List[Tree] =
+    if (trees.exists(_.span.contains(span)))
+      NavigateAST.pathTo(span, trees, skipZeroExtent = true)
         .collect { case t: untpd.Tree => t }
         .dropWhile(!_.hasType).asInstanceOf[List[tpd.Tree]]
     else Nil
@@ -293,8 +293,10 @@ object Interactive {
             // in subsequent parameter sections
           localCtx
         case tree: MemberDef =>
-          assert(tree.symbol.exists)
-          outer.localContext(tree, tree.symbol)
+          if (tree.symbol.exists)
+            outer.localContext(tree, tree.symbol)
+          else
+            outer
         case tree @ Block(stats, expr) =>
           val localCtx = outer.fresh.setNewScope
           stats.foreach {
@@ -310,7 +312,7 @@ object Interactive {
           }
           localCtx
         case tree @ Template(constr, parents, self, _) =>
-          if ((constr :: self :: parents).contains(nested)) ctx
+          if ((constr :: self :: parents).contains(nested)) outer
           else contextOfStat(tree.body, nested, tree.symbol, outer.inClassContext(self.symbol))
         case _ =>
           outer

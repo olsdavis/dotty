@@ -177,7 +177,7 @@ class HoverTest {
 
   @Test def i4678: Unit = {
     code"""class Foo {
-          |  val x: Int = (${m1}1:${m2} ${m3}@annot1 @annot2 @annot3 @annot4 @annot5${m4})
+          |  val x: Int = (${m1}1:${m2} ${m3}@annot1${m4} ${m5}@annot2${m6} ${m7}@annot3${m8} ${m9}@annot4${m10} ${m11}@annot5${m12})
           |}
           |class annot1 extends scala.annotation.Annotation
           |class annot2 extends scala.annotation.Annotation
@@ -186,7 +186,11 @@ class HoverTest {
           |class annot5 extends scala.annotation.Annotation
           |""".withSource
       .hover(m1 to m2, hoverContent("(1 : Int)"))
-      .hover(m3 to m4, hoverContent("(1 : Int) @annot1 @annot2 @annot3 @annot4 @annot5"))
+      .hover(m3 to m4, hoverContent("annot1"))
+      .hover(m5 to m6, hoverContent("annot2"))
+      .hover(m7 to m8, hoverContent("annot3"))
+      .hover(m9 to m10, hoverContent("annot4"))
+      .hover(m11 to m12, hoverContent("annot5"))
   }
 
   @Test def unicodeChar: Unit = {
@@ -208,5 +212,35 @@ class HoverTest {
       // The test framework will place the code above in a virtual file called Source0.scala,
       // sp the top-level definitions should be enclosed in an object called `Source0$package`.
       .hover(m1 to m2, hoverContent("(hello.Source0$package : hello.Source0$package.type)"))
+  }
+
+  @Test def enumsRepeated: Unit = {
+    code"""|package example
+           |object SimpleEnum:
+           |  enum Color:
+           |    case ${m1}Red${m2}, Green, Blue
+           |""".withSource
+      .hover(m1 to m2, hoverContent("example.SimpleEnum.Color"))
+  }
+  
+  @Test def enums: Unit = {
+    code"""|package example
+           |enum TestEnum3:
+           | case ${m1}A${m2} // no tooltip
+           |
+           |""".withSource
+      .hover(m1 to m2, hoverContent("example.TestEnum3"))
+  }
+  
+  @Test def tuple: Unit = {
+    code"""|object A:
+           |  val (${m1}first${m2}, second) = (1.0, 2)""".withSource
+      .hover(m1 to m2, hoverContent("Double"))
+  }
+
+  @Test def multiAssigment: Unit = {
+    code"""|val ${m1}x${m2}, ${m3}y${m4} = 42.0""".withSource
+      .hover(m1 to m2, hoverContent("Double"))
+      .hover(m3 to m4, hoverContent("Double"))
   }
 }

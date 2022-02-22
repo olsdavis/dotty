@@ -1,5 +1,7 @@
 package scala.runtime
 
+import scala.annotation.experimental
+
 object Tuples {
 
   inline val MaxSpecialized = 22
@@ -353,6 +355,160 @@ object Tuples {
   def tail(self: NonEmptyTuple): Tuple = (self: Any) match {
     case xxl: TupleXXL => xxlTail(xxl)
     case _ => specialCaseTail(self)
+  }
+
+  // Append for TupleXXL
+  private def xxlAppend(x: Any, xxl: TupleXXL): TupleXXL = {
+    val arr = new Array[Object](xxl.productArity + 1)
+    arr(xxl.productArity) = x.asInstanceOf[Object]
+    System.arraycopy(xxl.elems, 0, arr, 0, xxl.productArity)
+    TupleXXL.fromIArray(arr.asInstanceOf[IArray[Object]])
+  }
+
+  // Append for Tuple1 to Tuple22
+  private def specialCaseAppend(x: Any, self: Tuple): Tuple = {
+    (self: Any) match {
+      case EmptyTuple =>
+        Tuple1(x)
+      case self: Tuple1[_] =>
+        Tuple2(self._1, x)
+      case self: Tuple2[_, _] =>
+        Tuple3(self._1, self._2, x)
+      case self: Tuple3[_, _, _] =>
+        Tuple4(self._1, self._2, self._3, x)
+      case self: Tuple4[_, _, _, _] =>
+        Tuple5(self._1, self._2, self._3, self._4, x)
+      case self: Tuple5[_, _, _, _, _] =>
+        Tuple6(self._1, self._2, self._3, self._4, self._5, x)
+      case self: Tuple6[_, _, _, _, _, _] =>
+        Tuple7(self._1, self._2, self._3, self._4, self._5, self._6, x)
+      case self: Tuple7[_, _, _, _, _, _, _] =>
+        Tuple8(self._1, self._2, self._3, self._4, self._5, self._6, self._7, x)
+      case self: Tuple8[_, _, _, _, _, _, _, _] =>
+        Tuple9(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, x)
+      case self: Tuple9[_, _, _, _, _, _, _, _, _] =>
+        Tuple10(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, x)
+      case self: Tuple10[_, _, _, _, _, _, _, _, _, _] =>
+        Tuple11(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, x)
+      case self: Tuple11[_, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple12(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, x)
+      case self: Tuple12[_, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple13(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, x)
+      case self: Tuple13[_, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple14(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, x)
+      case self: Tuple14[_, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple15(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, x)
+      case self: Tuple15[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple16(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, x)
+      case self: Tuple16[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple17(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, x)
+      case self: Tuple17[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple18(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, x)
+      case self: Tuple18[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple19(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, x)
+      case self: Tuple19[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple20(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, self._19, x)
+      case self: Tuple20[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple21(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, self._19, self._20, x)
+      case self: Tuple21[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple22(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, self._19, self._20, self._21, x)
+      case self: Tuple22[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        val arr: Array[Object] = Array(
+          self._1.asInstanceOf[Object], self._2.asInstanceOf[Object],
+          self._3.asInstanceOf[Object], self._4.asInstanceOf[Object], self._5.asInstanceOf[Object],
+          self._6.asInstanceOf[Object], self._7.asInstanceOf[Object], self._8.asInstanceOf[Object],
+          self._9.asInstanceOf[Object], self._10.asInstanceOf[Object], self._11.asInstanceOf[Object],
+          self._12.asInstanceOf[Object], self._13.asInstanceOf[Object], self._14.asInstanceOf[Object],
+          self._15.asInstanceOf[Object], self._16.asInstanceOf[Object], self._17.asInstanceOf[Object],
+          self._18.asInstanceOf[Object], self._19.asInstanceOf[Object], self._20.asInstanceOf[Object],
+          self._21.asInstanceOf[Object], self._22.asInstanceOf[Object], x.asInstanceOf[Object]
+        )
+        TupleXXL.fromIArray(arr.asInstanceOf[IArray[Object]]).asInstanceOf[Tuple]
+    }
+  }
+
+  @experimental
+  def append(x: Any, self: Tuple): Tuple = (self: Any) match {
+    case xxl: TupleXXL => xxlAppend(x, xxl).asInstanceOf[Tuple]
+    case _ => specialCaseAppend(x, self)
+  }
+
+  // Init for TupleXXL
+  private def xxlInit(xxl: TupleXXL): Tuple = {
+    if (xxl.productArity == 23) {
+      val elems = xxl.elems
+      Tuple22(
+        elems(0), elems(1), elems(2), elems(3), elems(4), elems(5),
+        elems(6), elems(7), elems(8), elems(9), elems(10), elems(11),
+        elems(12), elems(13), elems(14), elems(15), elems(16), elems(17),
+        elems(18), elems(19), elems(20), elems(21)
+      )
+    } else {
+      val arr = new Array[Object](xxl.elems.length - 1)
+      System.arraycopy(xxl.elems, 0, arr, 0, xxl.elems.length - 1)
+      TupleXXL.fromIArray(arr.asInstanceOf[IArray[Object]]).asInstanceOf[Tuple]
+    }
+  }
+
+  // Init for Tuple1 to Tuple22
+  private def specialCaseInit(self: Tuple): Tuple = {
+    (self: Any) match {
+      case _: Tuple1[_] =>
+        EmptyTuple
+      case self: Tuple2[_, _] =>
+        Tuple1(self._1)
+      case self: Tuple3[_, _, _] =>
+        Tuple2(self._1, self._2)
+      case self: Tuple4[_, _, _, _] =>
+        Tuple3(self._1, self._2, self._3)
+      case self: Tuple5[_, _, _, _, _] =>
+        Tuple4(self._1,self._2, self._3, self._4)
+      case self: Tuple6[_, _, _, _, _, _] =>
+        Tuple5(self._1, self._2, self._3, self._4, self._5)
+      case self: Tuple7[_, _, _, _, _, _, _] =>
+        Tuple6(self._1, self._2, self._3, self._4, self._5, self._6)
+      case self: Tuple8[_, _, _, _, _, _, _, _] =>
+        Tuple7(self._1, self._2, self._3, self._4, self._5, self._6, self._7)
+      case self: Tuple9[_, _, _, _, _, _, _, _, _] =>
+        Tuple8(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8)
+      case self: Tuple10[_, _, _, _, _, _, _, _, _, _] =>
+        Tuple9(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9)
+      case self: Tuple11[_, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple10(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10)
+      case self: Tuple12[_, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple11(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11)
+      case self: Tuple13[_, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple12(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12)
+      case self: Tuple14[_, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple13(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13)
+      case self: Tuple15[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple14(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14)
+      case self: Tuple16[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple15(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15)
+      case self: Tuple17[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple16(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16)
+      case self: Tuple18[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple17(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17)
+      case self: Tuple19[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple18(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18)
+      case self: Tuple20[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple19(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, self._19)
+      case self: Tuple21[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple20(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, self._19, self._20)
+      case self: Tuple22[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _] =>
+        Tuple21(self._1, self._2, self._3, self._4, self._5, self._6, self._7, self._8, self._9, self._10, self._11, self._12, self._13, self._14, self._15, self._16, self._17, self._18, self._19, self._20, self._21)
+    }
+  }
+
+  @experimental
+  def init(self: NonEmptyTuple): Tuple = (self: Any) match {
+    case xxl: TupleXXL => xxlInit(xxl)
+    case _ => specialCaseInit(self)
+  }
+
+  @experimental
+  def last(self: NonEmptyTuple): Any = (self: Any) match {
+    case self: Product => self.productElement(self.productArity - 1)
   }
 
   def apply(self: NonEmptyTuple, n: Int): Any =

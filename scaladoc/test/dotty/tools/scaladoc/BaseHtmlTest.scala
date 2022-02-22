@@ -24,34 +24,34 @@ class BaseHtmlTest:
 
   def withGeneratedDoc(
     pcks: Seq[String],
-    docsRoot: Option[String] = None)(
+    docsRoot: Option[String] = None,
+    customArgs: Option[Scaladoc.Args] = None,
+  )(
     op: ProjectContext ?=> Unit,
-    ): Unit =
-      val dest = Files.createTempDirectory("test-doc")
-      try
-        val args = Scaladoc.Args(
-            name = projectName,
-            tastyFiles = pcks.flatMap(tastyFiles(_)),
-            output = dest.toFile,
-            docsRoot = docsRoot,
-            projectVersion = Some(projectVersion)
-          )
-        Scaladoc.run(args)(using testContext)
-        op(using ProjectContext(dest))
+  ): Unit =
+    val dest = customArgs.fold(Files.createTempDirectory("test-doc").toFile)(_.output)
+    try
+      val args = customArgs.getOrElse(Scaladoc.Args(
+        name = projectName,
+        tastyFiles = pcks.flatMap(tastyFiles(_)),
+        output = dest,
+        docsRoot = docsRoot,
+        projectVersion = Some(projectVersion)
+      ))
+      Scaladoc.run(args)(using testContext)
+      op(using ProjectContext(args.output.toPath))
 
-      finally IO.delete(dest.toFile)
-
-  val testDocPath = Paths.get(BuildInfo.testDocumentationRoot)
-
+    finally IO.delete(dest)
+  end withGeneratedDoc
   class DocumentContext(d: Document, path: Path):
     import collection.JavaConverters._
 
     def niceMsg(msg: String) = s"$msg in $path (body):\n ${d.html()}:\n"
 
     def assertTextsIn(selector: String, expected: String*) =
-      assertFalse(niceMsg("Selector not found"), d.select(selector).isEmpty)
+      assertFalse(niceMsg(s"Selector not found for '$selector'"), d.select(selector).isEmpty)
       val found = d.select(selector).eachText.asScala
-      assertEquals(niceMsg(s"Context does not match for '$selector'"), expected.toList, found.toList)
+      assertEquals(niceMsg(s"Content does not match for '$selector'"), expected.toList, found.toList)
 
     def assertAttr(selector: String, attr: String, expected: String*) =
       assertFalse(niceMsg(s"Selector '$selector' not found"), d.select(selector).isEmpty)
@@ -61,6 +61,9 @@ class BaseHtmlTest:
     def assertNotExists(selector: String) =
       val msg = niceMsg(s"Selector '$selector' exisits in document")
       assertTrue(msg, d.select(selector).isEmpty)
+
+    def fileExists =
+      assertTrue(path.toFile.exists)
 
   def withHtmlFile(pathStr: String)(op: DocumentContext => Unit)(using ProjectContext) =
     val path = summon[ProjectContext].path.resolve(pathStr)

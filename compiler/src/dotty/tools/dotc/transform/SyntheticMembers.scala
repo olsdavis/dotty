@@ -63,12 +63,10 @@ class SyntheticMembers(thisPhase: DenotTransformer) {
   private def initSymbols(using Context) =
     if (myValueSymbols.isEmpty) {
       myValueSymbols = List(defn.Any_hashCode, defn.Any_equals)
-      myCaseSymbols = myValueSymbols ++ List(defn.Any_toString, defn.Product_canEqual,
-        defn.Product_productArity, defn.Product_productPrefix, defn.Product_productElement,
-        defn.Product_productElementName)
+      myCaseSymbols = defn.caseClassSynthesized
       myCaseModuleSymbols = myCaseSymbols.filter(_ ne defn.Any_equals)
       myEnumValueSymbols = List(defn.Product_productPrefix)
-      myNonJavaEnumValueSymbols = myEnumValueSymbols :+ defn.Any_toString
+      myNonJavaEnumValueSymbols = myEnumValueSymbols :+ defn.Any_toString :+ defn.Enum_ordinal
     }
 
   def valueSymbols(using Context): List[Symbol] = { initSymbols; myValueSymbols }
@@ -134,6 +132,17 @@ class SyntheticMembers(thisPhase: DenotTransformer) {
         else // assume owner is `val Foo = new MyEnum { def ordinal = 0 }`
           Literal(Constant(clazz.owner.name.toString))
 
+      def ordinalRef: Tree =
+        if isSimpleEnumValue then // owner is `def $new(_$ordinal: Int, $name: String) = new MyEnum { ... }`
+          ref(clazz.owner.paramSymss.head.find(_.name == nme.ordinalDollar_).get)
+        else // val CaseN = new MyEnum { ... def ordinal: Int = n }
+          val vdef = clazz.owner
+          val parentEnum = vdef.owner.companionClass
+          val children = parentEnum.children.zipWithIndex
+          val candidate: Option[Int] = children.collectFirst { case (child, idx) if child == vdef => idx }
+          assert(candidate.isDefined, i"could not find child for $vdef")
+          Literal(Constant(candidate.get))
+
       def toStringBody(vrefss: List[List[Tree]]): Tree =
         if (clazz.is(ModuleClass)) ownName
         else if (isNonJavaEnumValue) identifierRef
@@ -145,6 +154,7 @@ class SyntheticMembers(thisPhase: DenotTransformer) {
         case nme.toString_ => toStringBody(vrefss)
         case nme.equals_ => equalsBody(vrefss.head.head)
         case nme.canEqual_ => canEqualBody(vrefss.head.head)
+        case nme.ordinal => ordinalRef
         case nme.productArity => Literal(Constant(accessors.length))
         case nme.productPrefix if isEnumValue => nameRef
         case nme.productPrefix => ownName
@@ -525,7 +535,7 @@ class SyntheticMembers(thisPhase: DenotTransformer) {
           val pat = Typed(untpd.Ident(nme.WILDCARD).withType(patType), TypeTree(patType))
           CaseDef(pat, EmptyTree, Literal(Constant(idx)))
         }
-      Match(param, cases)
+      Match(param.annotated(New(defn.UncheckedAnnot.typeRef, Nil)), cases)
     }
 
   /** - If `impl` is the companion of a generic sum, add `deriving.Mirror.Sum` parent
@@ -600,7 +610,16 @@ class SyntheticMembers(thisPhase: DenotTransformer) {
 
   def addSyntheticMembers(impl: Template)(using Context): Template = {
     val clazz = ctx.owner.asClass
+    val syntheticMembers = serializableObjectMethod(clazz) ::: serializableEnumValueMethod(clazz) ::: caseAndValueMethods(clazz)
+    checkInlining(syntheticMembers)
     addMirrorSupport(
-      cpy.Template(impl)(body = serializableObjectMethod(clazz) ::: serializableEnumValueMethod(clazz) ::: caseAndValueMethods(clazz) ::: impl.body))
+      cpy.Template(impl)(body = syntheticMembers ::: impl.body))
   }
+
+  private def checkInlining(syntheticMembers: List[Tree])(using Context): Unit =
+    if syntheticMembers.exists(_.existsSubTree {
+      case tree: GenericApply => tree.symbol.isAllOf(InlineMethod)
+      case tree: Select => tree.symbol.isAllOf(InlineMethod)
+      case _ => false
+    }) then ctx.compilationUnit.needsInlining = true
 }

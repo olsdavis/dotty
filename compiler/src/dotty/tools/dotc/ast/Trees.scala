@@ -16,17 +16,10 @@ import annotation.internal.sharable
 import annotation.unchecked.uncheckedVariance
 import annotation.constructorOnly
 import Decorators._
-import dotty.tools.dotc.core.tasty.TreePickler.Hole
 
 object Trees {
 
-  // Note: it would be more logical to make Untyped = Nothing.
-  // However, this interacts in a bad way with Scala's current type inference.
-  // In fact, we cannot write something like Select(pre, name), where pre is
-  // of type Tree[Nothing]; type inference will treat the Nothing as an uninstantiated
-  // value and will not infer Nothing as the type parameter for Select.
-  // We should come back to this issue once type inference is changed.
-  type Untyped = Null
+  type Untyped = Nothing
 
   /** The total number of created tree nodes, maintained if Stats.enabled */
   @sharable var ntrees: Int = 0
@@ -45,8 +38,7 @@ object Trees {
    *
    *   - You can never observe a `tpe` which is `null` (throws an exception)
    *   - So when creating a typed tree with `withType` we can re-use
-   *     the existing tree transparently, assigning its `tpe` field,
-   *     provided it was `null` before.
+   *     the existing tree transparently, assigning its `tpe` field.
    *   - It is impossible to embed untyped trees in typed ones.
    *   - Typed trees can be embedded in untyped ones provided they are rooted
    *     in a TypedSplice node.
@@ -980,6 +972,15 @@ object Trees {
   def genericEmptyValDef[T >: Untyped]: ValDef[T]       = theEmptyValDef.asInstanceOf[ValDef[T]]
   def genericEmptyTree[T >: Untyped]: Thicket[T]        = theEmptyTree.asInstanceOf[Thicket[T]]
 
+  /** Tree that replaces a splice in pickled quotes.
+   *  It is only used when picking quotes (Will never be in a TASTy file).
+   */
+  case class Hole[-T >: Untyped](isTermHole: Boolean, idx: Int, args: List[Tree[T]])(implicit @constructorOnly src: SourceFile) extends Tree[T] {
+    type ThisTree[-T >: Untyped] <: Hole[T]
+    override def isTerm: Boolean = isTermHole
+    override def isType: Boolean = !isTermHole
+  }
+
   def flatten[T >: Untyped](trees: List[Tree[T]]): List[Tree[T]] = {
     def recur(buf: ListBuffer[Tree[T]], remaining: List[Tree[T]]): ListBuffer[Tree[T]] =
       remaining match {
@@ -1103,6 +1104,8 @@ object Trees {
     type PackageDef = Trees.PackageDef[T]
     type Annotated = Trees.Annotated[T]
     type Thicket = Trees.Thicket[T]
+
+    type Hole = Trees.Hole[T]
 
     @sharable val EmptyTree: Thicket = genericEmptyTree
     @sharable val EmptyValDef: ValDef = genericEmptyValDef
@@ -1396,8 +1399,8 @@ object Trees {
               cpy.NamedArg(tree)(name, transform(arg))
             case Assign(lhs, rhs) =>
               cpy.Assign(tree)(transform(lhs), transform(rhs))
-            case Block(stats, expr) =>
-              cpy.Block(tree)(transformStats(stats, ctx.owner), transform(expr))
+            case blk: Block =>
+              transformBlock(blk)
             case If(cond, thenp, elsep) =>
               cpy.If(tree)(transform(cond), transform(thenp), transform(elsep))
             case Closure(env, meth, tpt) =>
@@ -1486,6 +1489,8 @@ object Trees {
 
       def transformStats(trees: List[Tree], exprOwner: Symbol)(using Context): List[Tree] =
         transform(trees)
+      def transformBlock(blk: Block)(using Context): Block =
+        cpy.Block(blk)(transformStats(blk.stats, ctx.owner), transform(blk.expr))
       def transform(trees: List[Tree])(using Context): List[Tree] =
         flatten(trees mapConserve (transform(_)))
       def transformSub[Tr <: Tree](tree: Tr)(using Context): Tr =

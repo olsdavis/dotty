@@ -8,7 +8,7 @@ import collection.mutable
 import Symbols._, Contexts._, Types._, StdNames._, NameOps._
 import ast.Trees._
 import util.Spans._
-import typer.Applications.{isProductMatch, isGetMatch, isProductSeqMatch, productSelectors, productArity, unapplySeqTypeElemTp}
+import typer.Applications.*
 import SymUtils._
 import Flags._, Constants._
 import Decorators._
@@ -20,13 +20,16 @@ import util.Property._
 
 /** The pattern matching transform.
  *  After this phase, the only Match nodes remaining in the code are simple switches
- *  where every pattern is an integer constant
+ *  where every pattern is an integer or string constant
  */
 class PatternMatcher extends MiniPhase {
   import ast.tpd._
   import PatternMatcher._
 
   override def phaseName: String = PatternMatcher.name
+
+  override def description: String = PatternMatcher.description
+
   override def runsAfter: Set[String] = Set(ElimRepeated.name)
 
   override def transformMatch(tree: Match)(using Context): Tree =
@@ -53,11 +56,12 @@ object PatternMatcher {
   import ast.tpd._
 
   val name: String = "patternMatcher"
+  val description: String = "compile pattern matches"
 
-  final val selfCheck = false // debug option, if on we check that no case gets generated twice
+  inline val selfCheck = false // debug option, if on we check that no case gets generated twice
 
   /** Minimal number of cases to emit a switch */
-  final val MinSwitchCases = 4
+  inline val MinSwitchCases = 4
 
   val TrustedTypeTestKey: Key[Unit] = new StickyKey[Unit]
 
@@ -231,8 +235,8 @@ object PatternMatcher {
         case _ =>
           tree.tpe
 
-      /** Plan for matching `selectors` against argument patterns `args` */
-      def matchArgsPlan(selectors: List[Tree], args: List[Tree], onSuccess: Plan): Plan = {
+      /** Plan for matching `components` against argument patterns `args` */
+      def matchArgsPlan(components: List[Tree], args: List[Tree], onSuccess: Plan): Plan = {
         /* For a case with arguments that have some test on them such as
          * ```
          * case Foo(1, 2) => someCode
@@ -249,9 +253,9 @@ object PatternMatcher {
          * } else ()
          * ```
          */
-        def matchArgsSelectorsPlan(selectors: List[Tree], syms: List[Symbol]): Plan =
-          selectors match {
-            case selector :: selectors1 => letAbstract(selector, selector.avoidPatBoundType())(sym => matchArgsSelectorsPlan(selectors1, sym :: syms))
+        def matchArgsComponentsPlan(components: List[Tree], syms: List[Symbol]): Plan =
+          components match {
+            case component :: components1 => letAbstract(component, component.avoidPatBoundType())(sym => matchArgsComponentsPlan(components1, sym :: syms))
             case Nil => matchArgsPatternPlan(args, syms.reverse)
           }
         def matchArgsPatternPlan(args: List[Tree], syms: List[Symbol]): Plan =
@@ -263,7 +267,7 @@ object PatternMatcher {
               assert(syms.isEmpty)
               onSuccess
           }
-        matchArgsSelectorsPlan(selectors, Nil)
+        matchArgsComponentsPlan(components, Nil)
       }
 
       /** Plan for matching the sequence in `seqSym` against sequence elements `args`.
@@ -325,8 +329,17 @@ object PatternMatcher {
         def isSyntheticScala2Unapply(sym: Symbol) =
           sym.isAllOf(SyntheticCase) && sym.owner.is(Scala2x)
 
+        def tupleApp(i: Int, receiver: Tree) = // manually inlining the call to NonEmptyTuple#apply, because it's an inline method
+          ref(defn.RuntimeTuplesModule)
+            .select(defn.RuntimeTuples_apply)
+            .appliedTo(receiver, Literal(Constant(i)))
+            .cast(args(i).tpe.widen)
+
         if (isSyntheticScala2Unapply(unapp.symbol) && caseAccessors.length == args.length)
-          matchArgsPlan(caseAccessors.map(ref(scrutinee).select(_)), args, onSuccess)
+          def tupleSel(sym: Symbol) = ref(scrutinee).select(sym)
+          val isGenericTuple = defn.isTupleClass(caseClass) && !defn.isTupleNType(tree.tpe)
+          val components = if isGenericTuple then caseAccessors.indices.toList.map(tupleApp(_, ref(scrutinee))) else caseAccessors.map(tupleSel)
+          matchArgsPlan(components, args, onSuccess)
         else if (unapp.tpe <:< (defn.BooleanType))
           TestPlan(GuardTest, unapp, unapp.span, onSuccess)
         else
@@ -344,6 +357,9 @@ object PatternMatcher {
             else if (isUnapplySeq && unapplySeqTypeElemTp(unapp.tpe.widen.finalResultType).exists) {
               unapplySeqPlan(unappResult, args)
             }
+            else if unappResult.info <:< defn.NonEmptyTupleTypeRef then
+              val components = (0 until foldApplyTupleType(unappResult.denot.info).length).toList.map(tupleApp(_, ref(unappResult)))
+              matchArgsPlan(components, args, onSuccess)
             else {
               assert(isGetMatch(unapp.tpe))
               val argsPlan = {
@@ -719,16 +735,19 @@ object PatternMatcher {
           val expectedTp = tpt.tpe
 
           // An outer test is needed in a situation like  `case x: y.Inner => ...`
-          def outerTestNeeded: Boolean =
-            // See the test for SI-7214 for motivation for dealias. Later `treeCondStrategy#outerTest`
-            // generates an outer test based on `patType.prefix` with automatically dealises.
-            expectedTp.dealias match {
+          def outerTestNeeded: Boolean = {
+            def go(expected: Type): Boolean = expected match {
               case tref @ TypeRef(pre: SingletonType, _) =>
                 tref.symbol.isClass &&
                 ExplicitOuter.needsOuterIfReferenced(tref.symbol.asClass)
+              case AppliedType(tpe, _) => go(tpe)
               case _ =>
                 false
             }
+            // See the test for SI-7214 for motivation for dealias. Later `treeCondStrategy#outerTest`
+            // generates an outer test based on `patType.prefix` with automatically dealises.
+            go(expectedTp.dealias)
+          }
 
           def outerTest: Tree = thisPhase.transformFollowingDeep {
             val expectedOuter = singleton(expectedTp.normalizedPrefix)
@@ -768,13 +787,15 @@ object PatternMatcher {
         (tpe isRef defn.IntClass) ||
         (tpe isRef defn.ByteClass) ||
         (tpe isRef defn.ShortClass) ||
-        (tpe isRef defn.CharClass)
+        (tpe isRef defn.CharClass) ||
+        (tpe isRef defn.StringClass)
 
-      val seen = mutable.Set[Int]()
+      val seen = mutable.Set[Any]()
 
-      def isNewIntConst(tree: Tree) = tree match {
-        case Literal(const) if const.isIntRange && !seen.contains(const.intValue) =>
-          seen += const.intValue
+      def isNewSwitchableConst(tree: Tree) = tree match {
+        case Literal(const)
+        if (const.isIntRange || const.tag == Constants.StringTag) && !seen.contains(const.value) =>
+          seen += const.value
           true
         case _ =>
           false
@@ -789,7 +810,7 @@ object PatternMatcher {
               val alts = List.newBuilder[Tree]
               def rec(innerPlan: Plan): Boolean = innerPlan match {
                 case SeqPlan(TestPlan(EqualTest(tree), scrut, _, ReturnPlan(`innerLabel`)), tail)
-                if scrut === scrutinee && isNewIntConst(tree) =>
+                if scrut === scrutinee && isNewSwitchableConst(tree) =>
                   alts += tree
                   rec(tail)
                 case ReturnPlan(`outerLabel`) =>
@@ -809,7 +830,7 @@ object PatternMatcher {
 
       def recur(plan: Plan): List[(List[Tree], Plan)] = plan match {
         case SeqPlan(testPlan @ TestPlan(EqualTest(tree), scrut, _, ons), tail)
-        if scrut === scrutinee && !canFallThrough(ons) && isNewIntConst(tree) =>
+        if scrut === scrutinee && !canFallThrough(ons) && isNewSwitchableConst(tree) =>
           (tree :: Nil, ons) :: recur(tail)
         case SeqPlan(AlternativesPlan(alts, ons), tail) =>
           (alts, ons) :: recur(tail)
@@ -832,29 +853,32 @@ object PatternMatcher {
 
     /** Emit a switch-match */
     private def emitSwitchMatch(scrutinee: Tree, cases: List[(List[Tree], Plan)]): Match = {
-      /* Make sure to adapt the scrutinee to Int, as well as all the alternatives
-       * of all cases, so that only Matches on pritimive Ints survive this phase.
+      /* Make sure to adapt the scrutinee to Int or String, as well as all the
+       * alternatives, so that only Matches on pritimive Ints or Strings survive
+       * this phase.
        */
 
-      val intScrutinee =
-        if (scrutinee.tpe.widen.isRef(defn.IntClass)) scrutinee
-        else scrutinee.select(nme.toInt)
+      val (primScrutinee, scrutineeTpe) =
+        if (scrutinee.tpe.widen.isRef(defn.IntClass)) (scrutinee, defn.IntType)
+        else if (scrutinee.tpe.widen.isRef(defn.StringClass)) (scrutinee, defn.StringType)
+        else (scrutinee.select(nme.toInt), defn.IntType)
 
-      def intLiteral(lit: Tree): Tree =
+      def primLiteral(lit: Tree): Tree =
         val Literal(constant) = lit
         if (constant.tag == Constants.IntTag) lit
+        else if (constant.tag == Constants.StringTag) lit
         else cpy.Literal(lit)(Constant(constant.intValue))
 
       val caseDefs = cases.map { (alts, ons) =>
         val pat = alts match {
-          case alt :: Nil => intLiteral(alt)
-          case Nil => Underscore(defn.IntType) // default case
-          case _ => Alternative(alts.map(intLiteral))
+          case alt :: Nil => primLiteral(alt)
+          case Nil => Underscore(scrutineeTpe) // default case
+          case _ => Alternative(alts.map(primLiteral))
         }
         CaseDef(pat, EmptyTree, emit(ons))
       }
 
-      Match(intScrutinee, caseDefs)
+      Match(primScrutinee, caseDefs)
     }
 
     /** If selfCheck is `true`, used to check whether a tree gets generated twice */

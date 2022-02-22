@@ -13,21 +13,31 @@ import java.nio.file.Path
 import java.nio.file.Files
 import java.io.File
 import scala.util.matching._
+import dotty.tools.scaladoc.util.Escape._
 
 val UnresolvedLocationLink = "#"
 
 trait Locations(using ctx: DocContext):
   def effectiveMembers: Map[DRI, Member]
 
+  // We generate this collection only if there may be a conflict with resources.
+  // Potentially can be quite big.
+  lazy val apiPaths = effectiveMembers.keySet.filterNot(_.isStaticFile).map(absolutePath(_))
+
   var cache = new JHashMap[DRI, Seq[String]]()
+
+  private[renderers] def pathsConflictResoultionMsg =
+    "Using `-Yapi-subdirectory` flag will move all API documentation into `api` subdirectory and will fix this conflict."
 
   // TODO verify if location exisits
   def rawLocation(dri: DRI): Seq[String] =
     cache.get(dri) match
       case null =>
         val path = dri match
-          case `docsRootDRI` => List("docs", "index")
-          case `apiPageDRI` => List("api", "index")
+          case `apiPageDRI` =>
+            if ctx.args.apiSubdirectory && ctx.staticSiteContext.nonEmpty
+              then List("api", "index")
+              else List("index")
           case dri if dri.isStaticFile =>
             Paths.get(dri.location).iterator.asScala.map(_.toString).toList
           case dri =>
@@ -36,8 +46,7 @@ trait Locations(using ctx: DocContext):
               case "<empty>" :: Nil  => "_empty_" :: Nil
               case "<empty>" :: tail => "_empty_" :: tail
               case other => other
-
-            Seq("api") ++ fqn
+            if ctx.args.apiSubdirectory then "api" :: fqn else fqn
         cache.put(dri, path)
         path
       case cached => cached
@@ -71,13 +80,14 @@ trait Locations(using ctx: DocContext):
     pathToRaw(from, to.split("/").toList)
 
   def resolveRoot(dri: DRI, path: String): String = resolveRoot(rawLocation(dri), path)
-  def absolutePath(dri: DRI): String = rawLocation(dri).mkString("", "/", ".html")
+  def absolutePath(dri: DRI, extension: String = "html"): String = rawLocation(dri).mkString("", "/", s".$extension")
+  def absolutePathWithAnchor(dri: DRI, extension: String = "html"): String = s"${absolutePath(dri, extension)}#${dri.anchor}"
 
   def resolveLink(dri: DRI, url: String): String =
     if URI(url).isAbsolute then url else resolveRoot(dri, url)
 
   def pathToRoot(dri: DRI): String = rawLocation(dri).drop(1).map(_ => "..") match
     case Nil => ""
-    case seq => seq.mkString("", "/", "/")
+    case seq => seq.mkString("", "/" , "/")
 
   def driExists(dri: DRI) = effectiveMembers.get(dri).isDefined || dri.isStaticFile

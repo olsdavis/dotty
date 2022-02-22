@@ -9,7 +9,7 @@ import collection.mutable
 
 @sharable object Stats {
 
-  final val enabled = false
+  inline val enabled = false
 
   var monitored: Boolean = false
 
@@ -43,7 +43,7 @@ import collection.mutable
     else op
   }
 
-  final val GroupChar = '/'
+  inline val GroupChar = '/'
 
   /** Aggregate all counts of all keys with a common prefix, followed by `:` */
   private def aggregate(): Unit = {
@@ -62,6 +62,7 @@ import collection.mutable
         aggregate()
         println()
         println(hits.toList.sortBy(_._2).map{ case (x, y) => s"$x -> $y" } mkString "\n")
+        hits.clear()
       }
     }
     else op

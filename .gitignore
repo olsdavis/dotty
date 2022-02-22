@@ -58,6 +58,9 @@ tests/partest-generated/
 tests/locks/
 /test-classes/
 
+# Benchmarks
+bench/tests-generated
+
 # Ignore output files but keep the directory
 out/
 build/
@@ -96,3 +99,13 @@ community-build/dotty-community-build-deps
 
 # Bloop
 .bsp
+
+# Coursier
+cs
+
+# Coursier test product
+compiler/test-coursier/run/*.jar
+
+# docs related
+contributors.js
+content-contributors.css

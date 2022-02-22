@@ -2,5 +2,5 @@
 1 |def f: Unit = // error
   |             ^
   |             expression expected but [31mend[0m found
-
-longer explanation available when compiling with `-explain`
+  |
+  | longer explanation available when compiling with `-explain`
